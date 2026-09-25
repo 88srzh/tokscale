@@ -1981,9 +1981,9 @@ fn parser_version(client: ClientId) -> u32 {
         // `step/start` clock of its `(turn, step)` and carries `duration_ms`.
         // Transcripts are append-only, so every cached row predates that field
         // and would keep the client reporting zero throughput until reparsed.
-        // v8->v9: request-header fallback billing evidence is labelled
-        // session-level while per-message source evidence remains record-level.
-        ClientId::Dsh => 9,
+        // v8->v9: upstream billing provenance distinguishes session headers.
+        // v9->v10: inherited usage ends at the last tagged end-seed marker.
+        ClientId::Dsh => 10,
         // First version of the fx (vercel-labs) usage-v2.json parser. Entries
         // are versioned from the start so later parser changes have an
         // obvious local counter to bump, like every other client here.
@@ -7564,7 +7564,7 @@ mod tests {
         // DSH transcript files are append-only, so v6 cache entries keep the
         // old cross-session attempt keys unless the source is reparsed. The
         // v7->v8 bump retires rows parsed without generation durations.
-        assert_eq!(parser_version(ClientId::Dsh), 9);
+        assert_eq!(parser_version(ClientId::Dsh), 10);
     }
 
     /// Names the row that only a served cache can put in a report. No DSH
