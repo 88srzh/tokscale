@@ -1061,6 +1061,7 @@ impl From<LegacyCodexStateV19> for CodexParseState {
             pending_usage_record: state.pending_usage_record,
             settled_usage_records: state.settled_usage_records,
             request_timing: Default::default(),
+            session_parent_thread_id: None,
         }
     }
 }
@@ -1155,6 +1156,7 @@ impl From<LegacyCodexStateV14> for CodexParseState {
             settled_usage_records: Default::default(),
             usage_event_ordinal: 0,
             request_timing: Default::default(),
+            session_parent_thread_id: None,
         }
     }
 }
@@ -1295,6 +1297,7 @@ impl From<LegacyCodexStateV15> for CodexParseState {
             usage_event_ordinal: state.usage_event_ordinal,
             turn_coverage: state.turn_coverage,
             request_timing: Default::default(),
+            session_parent_thread_id: None,
             pending_usage_record: None,
             settled_usage_records: Default::default(),
         }
@@ -1887,7 +1890,7 @@ fn parser_version(client: ClientId) -> u32 {
         // v18->v19: OpenCodex Responses combo attribution changes Codex's
         // reported model/provider identity without changing token totals.
         // The decoded archive limit remains an exact cache fingerprint marker.
-        // v20 combines OpenCodex attribution with downstream request timing.
+        // v20 combines OpenCodex attribution with downstream timing/parent state.
         ClientId::Codex => 20,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
