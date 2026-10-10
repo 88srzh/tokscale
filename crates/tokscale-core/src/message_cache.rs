@@ -5319,11 +5319,33 @@ mod tests {
             session: ContextOrigin::Trace,
             agent: ContextOrigin::Record,
         });
+        entry.messages[0].performance_timing =
+            Some(crate::sessions::PerformanceTiming::Duration(500));
         write_shard_with_limit(&path, identity, &[entry.clone()], MAX_CACHE_SHARD_BYTES).unwrap();
         let ShardReadStatus::Loaded(restored) = read_shard(&path, identity) else {
             panic!("expected Copilot envelope");
         };
         assert_eq!(restored[0].messages, entry.messages);
+
+        // Upstream's Copilot v12 context envelope has a V10 message layout,
+        // without the fork's explicit performance timing field. Reparse it
+        // rather than interpreting the same parser generation with new bytes.
+        let upstream = CachedShardEnvelope {
+            format_version: 12,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options()
+                .serialize(&vec![(
+                    LegacyCachedSourceEntryV10::from(entry.clone()),
+                    vec![entry.messages[0].copilot_context],
+                )])
+                .unwrap(),
+        };
+        fs::write(&path, bincode::options().serialize(&upstream).unwrap()).unwrap();
+        assert!(matches!(
+            read_shard(&path, identity),
+            ShardReadStatus::Stale
+        ));
 
         // A real pre-provenance payload has the unchanged generic entry layout.
         // It must be rejected, even if a header accidentally claims parser v12.
