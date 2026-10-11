@@ -7760,3 +7760,577 @@ fn test_codex_compressed_session_reports_usage() {
     assert_eq!(json["totalOutput"].as_i64().unwrap(), 10);
     assert_eq!(json["totalMessages"].as_i64().unwrap(), 1);
 }
+
+fn source_snapshot_fixture() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    prime_pricing_cache(tmp.path());
+    pin_bucket_timezone(tmp.path(), "Pacific/Kiritimati");
+    let dir = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/session1");
+    fs::create_dir_all(&dir).unwrap();
+    // Same source ID, two bucket days, two models and a zero-token row.
+    for (id, created, model, input, session) in [
+        (
+            "a",
+            1_772_451_000_000i64 - 86_400_000,
+            "model-a",
+            10,
+            serde_json::json!("session1"),
+        ),
+        (
+            "b",
+            1_772_474_400_000,
+            "model-b",
+            20,
+            serde_json::json!("session1"),
+        ),
+        (
+            "zero",
+            1_772_474_400_001,
+            "model-b",
+            0,
+            serde_json::json!("zero-session"),
+        ),
+        (
+            "null",
+            1_772_474_400_002,
+            "model-b",
+            3,
+            serde_json::Value::Null,
+        ),
+        (
+            "empty",
+            1_772_474_400_003,
+            "model-b",
+            4,
+            serde_json::json!(""),
+        ),
+    ] {
+        let row = serde_json::json!({
+            "id": id, "sessionID": session, "role": "assistant",
+            "modelID": model, "providerID": "provider", "cost": 0.05,
+            "tokens": {"input": input, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+            "time": {"created": created},
+        });
+        fs::write(
+            dir.join(format!("{id}.json")),
+            serde_json::to_vec(&row).unwrap(),
+        )
+        .unwrap();
+    }
+    tmp
+}
+
+fn snapshot_export(home: &Path, extra: &[&str]) -> serde_json::Value {
+    let output = cmd_with_home(home)
+        .env("TZ", "America/Los_Angeles")
+        .args(["graph", "--source-snapshots", "--no-spinner"])
+        .args(extra)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).unwrap()
+}
+
+#[test]
+fn test_graph_source_snapshots_contract_timezone_and_identity_residual() {
+    let tmp = source_snapshot_fixture();
+    let before = chrono::Utc::now();
+    let graph = snapshot_export(tmp.path(), &["--client", "opencode"]);
+    let after = chrono::Utc::now();
+    let source = &graph["sourceUsage"];
+    assert_eq!(source["version"], 1);
+    assert_eq!(source["eventIdentityVersion"], 1);
+    assert_eq!(source["fullHistory"], true);
+    assert_eq!(
+        source["replacementClients"],
+        serde_json::json!(["opencode"])
+    );
+    assert_eq!(source["partialClients"], serde_json::json!([]));
+    assert_eq!(source["bucketTimezone"], "Pacific/Kiritimati");
+    let captured =
+        chrono::DateTime::parse_from_rfc3339(source["capturedAt"].as_str().unwrap()).unwrap();
+    assert!(captured >= before && captured <= after);
+    let zone =
+        tokscale_core::bucket_tz::BucketTimezone::from_pinned_name(Some("Pacific/Kiritimati"));
+    assert_eq!(source["dayKey"], zone.day_key(captured.timestamp_millis()));
+    assert_eq!(source["rowsWithoutIdentity"]["opencode"], 2);
+    let sessions = source["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    let session = sessions
+        .iter()
+        .find(|s| s["sessionId"] == "session1")
+        .unwrap();
+    let days = session["days"].as_array().unwrap();
+    assert_eq!(days.len(), 2);
+    assert_eq!(days[0]["date"], "2026-03-02");
+    assert_eq!(days[1]["date"], "2026-03-03");
+    assert_eq!(session["events"].as_array().unwrap().len(), 2);
+    for event in session["events"].as_array().unwrap() {
+        let id = event["id"].as_str().unwrap();
+        assert_eq!(id.len(), 71);
+        assert!(id.starts_with("sha256:"));
+        for day in event["days"].as_array().unwrap() {
+            let session_day = days
+                .iter()
+                .find(|candidate| candidate["date"] == day["date"])
+                .unwrap();
+            assert_eq!(day, session_day);
+        }
+    }
+    assert_eq!(days[0]["clients"][0]["tokens"]["cacheRead"], 0);
+    assert!(days[0].get("token_breakdown").is_none());
+    assert!(days[0]["clients"][0].get("model_id").is_none());
+    assert!(days[0]["clients"][0].get("modelId").is_some());
+    assert!(days[0].get("tokenBreakdown").is_some());
+    let zero = sessions
+        .iter()
+        .find(|s| s["sessionId"] == "zero-session")
+        .unwrap();
+    assert_eq!(zero["days"][0]["totals"]["tokens"], 0);
+    assert_eq!(zero["days"][0]["totals"]["messages"], 1);
+    assert_eq!(graph["summary"]["totalTokens"], 37);
+    assert!(!serde_json::to_string(source)
+        .unwrap()
+        .contains("messages\": ["));
+}
+
+#[test]
+fn test_graph_source_snapshots_filters_and_opt_in_serialization() {
+    let tmp = source_snapshot_fixture();
+    let all = snapshot_export(tmp.path(), &[]);
+    assert_eq!(all["sourceUsage"]["sessions"].as_array().unwrap().len(), 2);
+    assert!(all["sourceUsage"]["replacementClients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|client| client == "opencode"));
+    assert_eq!(all["sourceUsage"]["partialClients"], serde_json::json!([]));
+    for filter in [
+        vec!["--since", "2030-01-01"],
+        vec!["--until", "2020-01-01"],
+        vec!["--year", "2020"],
+    ] {
+        let mut args = vec!["--client", "opencode"];
+        args.extend(filter);
+        let graph = snapshot_export(tmp.path(), &args);
+        assert_eq!(graph["sourceUsage"]["fullHistory"], false);
+        assert_eq!(graph["summary"]["totalTokens"], 0);
+        let sessions = graph["sourceUsage"]["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions
+            .iter()
+            .all(|s| s["days"].as_array().unwrap().is_empty()));
+        assert!(sessions
+            .iter()
+            .all(|s| s["events"].as_array().unwrap().is_empty()));
+    }
+    let excluded = snapshot_export(tmp.path(), &["--client", "codex"]);
+    assert_eq!(excluded["sourceUsage"]["fullHistory"], true);
+    assert!(excluded["sourceUsage"]["sessions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(excluded["sourceUsage"]["rowsWithoutIdentity"]
+        .as_object()
+        .unwrap()
+        .is_empty());
+    let normal = cmd_with_home(tmp.path())
+        .args(["graph", "--client", "opencode", "--no-spinner"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let normal: serde_json::Value = serde_json::from_slice(&normal).unwrap();
+    assert!(normal.get("sourceUsage").is_none());
+    assert_eq!(normal["contributions"], all["contributions"]);
+    for command in ["submit", "import"] {
+        cmd_with_home(tmp.path())
+            .args([command, "--source-snapshots", "--no-spinner"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("source-snapshots"));
+    }
+}
+
+#[test]
+fn test_graph_source_snapshots_refresh_coherent_priced_deduplicated_session() {
+    let tmp = source_snapshot_fixture();
+    // A complete override also affects provider-reported cost; snapshots must
+    // see exactly the priced/deduplicated stream used by aggregate graph days.
+    let config = tmp.path().join(".config/tokscale");
+    fs::write(
+        config.join("custom-pricing.json"),
+        r#"{"models":{"model-a":{"input_cost_per_token":1},"model-b":{"input_cost_per_token":2}}}"#,
+    )
+    .unwrap();
+    let dir = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/session1");
+    fs::copy(dir.join("a.json"), dir.join("duplicate-a.json")).unwrap();
+    let first = snapshot_export(tmp.path(), &["--client", "opencode"]);
+    let session = first["sourceUsage"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sessionId"] == "session1")
+        .unwrap();
+    assert_eq!(session["days"][0]["totals"]["tokens"], 10);
+    assert_eq!(session["days"][0]["totals"]["messages"], 1);
+    assert_eq!(session["days"][0]["totals"]["cost"], 10.0);
+    assert_eq!(session["days"][1]["totals"]["cost"], 40.0);
+    for day in session["days"].as_array().unwrap() {
+        let aggregate = first["contributions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["date"] == day["date"])
+            .unwrap();
+        assert!(
+            day["totals"]["cost"].as_f64().unwrap()
+                <= aggregate["totals"]["cost"].as_f64().unwrap()
+        );
+    }
+    fs::remove_file(dir.join("a.json")).unwrap();
+    fs::remove_file(dir.join("duplicate-a.json")).unwrap();
+    let mut row: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("b.json")).unwrap()).unwrap();
+    row["tokens"]["input"] = serde_json::json!(2);
+    row["modelID"] = serde_json::json!("model-a");
+    fs::write(dir.join("b.json"), serde_json::to_vec(&row).unwrap()).unwrap();
+    let corrected = snapshot_export(tmp.path(), &["--client", "opencode"]);
+    let session = corrected["sourceUsage"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sessionId"] == "session1")
+        .unwrap();
+    assert_eq!(session["days"].as_array().unwrap().len(), 1);
+    assert_eq!(session["days"][0]["date"], "2026-03-03");
+    assert_eq!(session["days"][0]["totals"]["tokens"], 2);
+    assert_eq!(session["days"][0]["totals"]["cost"], 2.0);
+    assert_eq!(session["days"][0]["clients"][0]["modelId"], "model-a");
+}
+
+#[test]
+fn test_graph_source_snapshots_resolve_local_zone_without_a_pin() {
+    let tmp = source_snapshot_fixture();
+    fs::remove_file(tmp.path().join(".config/tokscale/settings.json")).unwrap();
+    let output = cmd_with_home(tmp.path())
+        .env("TZ", "Etc/UTC")
+        .args([
+            "graph",
+            "--source-snapshots",
+            "--client",
+            "opencode",
+            "--no-spinner",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let graph: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let source = &graph["sourceUsage"];
+    let zone = tokscale_core::bucket_tz::BucketTimezone::from_pinned_name(
+        source["bucketTimezone"].as_str(),
+    );
+    assert!(zone.is_pinned());
+    let captured =
+        chrono::DateTime::parse_from_rfc3339(source["capturedAt"].as_str().unwrap()).unwrap();
+    assert_eq!(source["dayKey"], zone.day_key(captured.timestamp_millis()));
+    assert_eq!(source["sessions"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn test_graph_source_snapshots_synthetic_selection_has_no_full_client_authority() {
+    let tmp = source_snapshot_fixture();
+    let path = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/session1/a.json");
+    let mut gateway: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    gateway["providerID"] = serde_json::json!("synthetic");
+    fs::write(&path, serde_json::to_vec(&gateway).unwrap()).unwrap();
+    let partial = snapshot_export(tmp.path(), &["--client", "synthetic"]);
+    let source = &partial["sourceUsage"];
+    assert_eq!(source["fullHistory"], true);
+    assert_eq!(source["replacementClients"], serde_json::json!([]));
+    assert_eq!(source["partialClients"], serde_json::json!(["opencode"]));
+    assert_eq!(source["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(source["sessions"][0]["days"][0]["totals"]["tokens"], 10);
+    let complete = snapshot_export(
+        tmp.path(),
+        &["--client", "opencode", "--client", "synthetic"],
+    );
+    assert_eq!(
+        complete["sourceUsage"]["replacementClients"],
+        serde_json::json!(["opencode"])
+    );
+    assert_eq!(
+        complete["sourceUsage"]["partialClients"],
+        serde_json::json!([])
+    );
+    let default = snapshot_export(tmp.path(), &[]);
+    assert_eq!(default["contributions"], complete["contributions"]);
+    assert!(default["sourceUsage"]["replacementClients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|client| client == "opencode"));
+    assert_eq!(
+        default["sourceUsage"]["partialClients"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn test_graph_source_snapshots_omitted_session_retains_only_unclaimed_events() {
+    let tmp = source_snapshot_fixture();
+    let old = snapshot_export(tmp.path(), &["--client", "opencode"]);
+    let old_session = old["sourceUsage"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["sessionId"] == "session1")
+        .unwrap();
+    let old_dir = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/session1");
+    let new_dir = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/new-session");
+    fs::create_dir_all(&new_dir).unwrap();
+    let mut row: serde_json::Value =
+        serde_json::from_slice(&fs::read(old_dir.join("a.json")).unwrap()).unwrap();
+    row["sessionID"] = serde_json::json!("new-session");
+    row["tokens"]["input"] = serde_json::json!(2);
+    row["modelID"] = serde_json::json!("corrected-model");
+    fs::write(new_dir.join("a.json"), serde_json::to_vec(&row).unwrap()).unwrap();
+    fs::remove_file(old_dir.join("a.json")).unwrap();
+    fs::remove_file(old_dir.join("b.json")).unwrap();
+    let current = snapshot_export(tmp.path(), &["--client", "opencode"]);
+    assert!(!current["sourceUsage"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|session| session["sessionId"] == "session1"));
+    let new_session = current["sourceUsage"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["sessionId"] == "new-session")
+        .unwrap();
+    let new_events = new_session["events"].as_array().unwrap();
+    assert_eq!(new_events.len(), 1);
+    let old_events = old_session["events"].as_array().unwrap();
+    assert!(old_events
+        .iter()
+        .any(|event| event["id"] == new_events[0]["id"]));
+    let retained: Vec<_> = old_events
+        .iter()
+        .filter(|event| event["id"] != new_events[0]["id"])
+        .collect();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0]["days"][0]["totals"]["tokens"], 20);
+    assert_eq!(retained[0]["days"][0]["clients"][0]["modelId"], "model-b");
+    assert_eq!(new_events[0]["days"][0]["totals"]["tokens"], 2);
+    assert_eq!(
+        new_events[0]["days"][0]["clients"][0]["modelId"],
+        "corrected-model"
+    );
+    assert_eq!(new_events[0]["days"], new_session["days"]);
+}
+
+#[test]
+fn test_graph_source_snapshots_owned_client_and_casefolded_alias_scope() {
+    let tmp = source_snapshot_fixture();
+    let proma = tmp.path().join(".proma/agent-sessions/session.jsonl");
+    fs::create_dir_all(proma.parent().unwrap()).unwrap();
+    fs::write(
+        &proma,
+        serde_json::json!({
+            "type": "assistant", "timestamp": "2026-03-02T00:00:00Z",
+            "message": {"id": "owned-turn", "model": "claude-sonnet-4",
+                "usage": {"input_tokens": 10, "output_tokens": 5}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let owned = snapshot_export(tmp.path(), &["--client", "proma"]);
+    assert_eq!(
+        owned["sourceUsage"]["replacementClients"],
+        serde_json::json!(["proma"])
+    );
+    assert_eq!(
+        owned["sourceUsage"]["partialClients"],
+        serde_json::json!([])
+    );
+    assert_eq!(owned["summary"]["totalTokens"], 15);
+
+    let gjc = tmp.path().join(".gjc/agent/sessions/project/session.jsonl");
+    fs::create_dir_all(gjc.parent().unwrap()).unwrap();
+    let mut ids = Vec::new();
+    for alias in ["9Router", "9router", "gjc"] {
+        fs::write(&gjc, format!("{}\n{}\n",
+            serde_json::json!({"type": "session", "id": "native-session", "cwd": "/fixture"}),
+            serde_json::json!({"type": "message", "id": "same-message", "message": {
+                "role": "assistant", "model": "model-a", "provider": "provider", "source": alias,
+                "timestamp": 1772474400000i64,
+                "usage": {"input": 10, "output": 5, "cost": {"total": 0.2}}
+            }})
+        )).unwrap();
+        let graph = snapshot_export(tmp.path(), &["--client", "gjc"]);
+        assert_eq!(
+            graph["sourceUsage"]["partialClients"],
+            serde_json::json!([])
+        );
+        assert_eq!(graph["sourceUsage"]["sessions"][0]["client"], alias);
+        ids.push(graph["sourceUsage"]["sessions"][0]["events"][0]["id"].clone());
+    }
+    assert!(ids.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
+fn test_graph_source_snapshots_copilot_sentinel_and_trace_fallback_contract() {
+    let tmp = source_snapshot_fixture();
+    let dir = tmp.path().join(".copilot/otel");
+    fs::create_dir_all(&dir).unwrap();
+    let mut rows = Vec::new();
+    for (span, trace, session, input) in [
+        ("missing", None, None, 11),
+        ("traced", Some("trace-fallback"), None, 3),
+        ("real", Some("real-trace"), Some("real-session"), 5),
+    ] {
+        let mut row = serde_json::json!({"type":"span","spanId":span,"name":"chat model-a","startTime":[1772474400i64,0],"attributes":{"gen_ai.operation.name":"chat","gen_ai.response.model":"model-a","gen_ai.usage.input_tokens":input}});
+        if let Some(trace) = trace {
+            row["traceId"] = serde_json::json!(trace);
+        }
+        if let Some(session) = session {
+            row["attributes"]["gen_ai.conversation.id"] = serde_json::json!(session);
+        }
+        rows.push(serde_json::to_string(&row).unwrap());
+    }
+    fs::write(dir.join("usage.jsonl"), rows.join("\n")).unwrap();
+    let graph = snapshot_export(tmp.path(), &["--client", "copilot"]);
+    assert_eq!(graph["summary"]["totalTokens"], 19);
+    let source = &graph["sourceUsage"];
+    assert_eq!(source["rowsWithoutIdentity"]["copilot"], 1);
+    let sessions = source["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions
+        .iter()
+        .any(|session| session["sessionId"] == "trace-fallback"));
+    assert!(sessions
+        .iter()
+        .any(|session| session["sessionId"] == "real-session"));
+    assert!(!sessions
+        .iter()
+        .any(|session| session["sessionId"] == "unknown-session"));
+    assert_eq!(
+        sessions
+            .iter()
+            .flat_map(|session| session["days"].as_array().unwrap())
+            .map(|day| day["totals"]["tokens"].as_i64().unwrap())
+            .sum::<i64>(),
+        8
+    );
+}
+
+#[test]
+fn test_graph_source_snapshots_native_antigravity_winner_migration_keeps_event_identity() {
+    fn varint(mut value: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while value >= 128 {
+            bytes.push((value as u8 & 127) | 128);
+            value >>= 7;
+        }
+        bytes.push(value as u8);
+        bytes
+    }
+    fn number(field: u64, value: u64) -> Vec<u8> {
+        let mut bytes = varint(field << 3);
+        bytes.extend(varint(value));
+        bytes
+    }
+    fn blob(field: u64, data: &[u8]) -> Vec<u8> {
+        let mut bytes = varint((field << 3) | 2);
+        bytes.extend(varint(data.len() as u64));
+        bytes.extend(data);
+        bytes
+    }
+    let tmp = source_snapshot_fixture();
+    let legacy_dir = tmp
+        .path()
+        .join(".config/tokscale/antigravity-cache/sessions");
+    fs::create_dir_all(&legacy_dir).unwrap();
+    let legacy_path = legacy_dir.join("legacy.jsonl");
+    fs::write(&legacy_path, serde_json::to_vec(&serde_json::json!({"type":"usage","sessionId":"legacy","responseId":"shared-response","timestamp":1772474400000i64,"modelId":"model-a","input":4,"output":2})).unwrap()).unwrap();
+    let mut usage = number(2, 4);
+    usage.extend(number(9, 2));
+    usage.extend(blob(11, b"shared-response"));
+    let clock = blob(4, &number(1, 1772474400));
+    let mut model = blob(4, &usage);
+    model.extend(blob(9, &clock));
+    model.extend(blob(19, b"model-a"));
+    let data = blob(1, &model);
+    let mut native_paths = Vec::new();
+    for (relative, name) in [
+        (".gemini/antigravity-cli/conversations", "cli"),
+        (".gemini/antigravity/conversations", "extension"),
+    ] {
+        let dir = tmp.path().join(relative);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.db"));
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE gen_metadata (idx integer, data blob, size integer);")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO gen_metadata VALUES (0, ?1, 0)",
+                rusqlite::params![&data],
+            )
+            .unwrap();
+        native_paths.push(path);
+    }
+    let mut event_id = None;
+    for (client, session) in [
+        ("antigravity", "legacy"),
+        ("antigravity-cli", "cli"),
+        ("antigravity-extension", "extension"),
+    ] {
+        let graph = snapshot_export(tmp.path(), &[]);
+        let sessions: Vec<_> = graph["sourceUsage"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|session| {
+                session["client"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("antigravity")
+            })
+            .collect();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["client"], client);
+        assert_eq!(sessions[0]["sessionId"], session);
+        assert_eq!(sessions[0]["days"][0]["totals"]["tokens"], 6);
+        let events = sessions[0]["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["days"], sessions[0]["days"]);
+        if let Some(id) = &event_id {
+            assert_eq!(&events[0]["id"], id);
+        } else {
+            event_id = Some(events[0]["id"].clone());
+        }
+        match client {
+            "antigravity" => fs::remove_file(&legacy_path).unwrap(),
+            "antigravity-cli" => fs::remove_file(&native_paths[0]).unwrap(),
+            _ => {}
+        }
+    }
+}

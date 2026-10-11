@@ -278,12 +278,17 @@ tokscale tui
 # Export contribution graph data as JSON
 tokscale graph --output data.json
 
+# Export source-only per-session daily snapshots (no recovery overlay)
+tokscale graph --source-snapshots --output source-data.json
+
 # Output data as JSON (for scripting/automation)
 tokscale --json                    # Default models view as JSON
 tokscale models --json             # Models breakdown as JSON
 tokscale monthly --json            # Monthly breakdown as JSON
 tokscale models --json > report.json   # Save to file
 ```
+
+`graph --source-snapshots` adds scanner-authoritative session and event daily accounting for retained-history consumers. It excludes recovery overlays, includes retained source-cache rows, and emits explicit full-client replacement scope. See the [source snapshot contract](docs/source-snapshots.md) for the schema, event ownership migration, unresolved identities, and partial-parse limits.
 
 ### TUI Features
 

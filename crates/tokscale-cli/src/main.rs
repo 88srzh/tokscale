@@ -231,6 +231,11 @@ enum Commands {
     },
     #[command(about = "Export contribution graph data as JSON")]
     Graph {
+        #[arg(
+            long,
+            help = "Include source-only per-session usage snapshots (excludes recovered aggregates)"
+        )]
+        source_snapshots: bool,
         #[arg(long, help = "Write to file instead of stdout")]
         output: Option<String>,
         #[command(flatten)]
@@ -822,6 +827,7 @@ fn main() -> Result<()> {
             run_qr_command(yes)
         }
         Some(Commands::Graph {
+            source_snapshots,
             output,
             clients,
             date,
@@ -830,6 +836,7 @@ fn main() -> Result<()> {
         }) => {
             let clients = build_client_filter(clients, &cli.home);
             run_graph_command(
+                source_snapshots,
                 output,
                 cli.home.clone(),
                 clients,
@@ -4991,6 +4998,141 @@ struct TsTokenContributionData {
     provenance: Option<TsSubmissionProvenance>,
 }
 
+// Export-only wrapper: submission and recovery DTOs have no sourceUsage field.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsGraphExport {
+    #[serde(flatten)]
+    graph: TsTokenContributionData,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_usage: Option<TsSourceUsage>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsSourceUsage {
+    version: u32,
+    event_identity_version: u32,
+    captured_at: String,
+    full_history: bool,
+    replacement_clients: Vec<String>,
+    partial_clients: Vec<String>,
+    bucket_timezone: String,
+    day_key: String,
+    sessions: Vec<TsSourceSessionUsage>,
+    rows_without_identity: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TsSourceSessionUsage {
+    client: String,
+    session_id: String,
+    days: Vec<TsDailyContribution>,
+    events: Vec<TsSourceEventUsage>,
+}
+
+#[derive(serde::Serialize)]
+struct TsSourceEventUsage {
+    id: Option<String>,
+    days: Vec<TsDailyContribution>,
+}
+
+fn to_ts_graph_export(graph: &tokscale_core::GraphResult) -> TsGraphExport {
+    TsGraphExport {
+        graph: to_ts_token_contribution_data(graph, None, None),
+        source_usage: graph.source_usage.as_ref().map(|source| TsSourceUsage {
+            version: source.version,
+            event_identity_version: source.event_identity_version,
+            captured_at: source.captured_at.clone(),
+            full_history: source.full_history,
+            replacement_clients: source.replacement_clients.clone(),
+            partial_clients: source.partial_clients.clone(),
+            bucket_timezone: source.bucket_timezone.clone(),
+            day_key: source.day_key.clone(),
+            rows_without_identity: source.rows_without_identity.clone(),
+            sessions: source
+                .sessions
+                .iter()
+                .map(|session| TsSourceSessionUsage {
+                    client: session.client.clone(),
+                    session_id: session.session_id.clone(),
+                    events: session
+                        .events
+                        .iter()
+                        .map(|event| TsSourceEventUsage {
+                            id: event.id.clone(),
+                            days: event
+                                .days
+                                .iter()
+                                .map(|day| {
+                                    to_ts_daily_contribution(
+                                        day,
+                                        &std::collections::BTreeSet::new(),
+                                    )
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                    days: session
+                        .days
+                        .iter()
+                        .map(|day| {
+                            to_ts_daily_contribution(day, &std::collections::BTreeSet::new())
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }),
+    }
+}
+
+fn to_ts_daily_contribution(
+    d: &tokscale_core::DailyContribution,
+    incomplete_cost_dates: &std::collections::BTreeSet<String>,
+) -> TsDailyContribution {
+    TsDailyContribution {
+        date: d.date.clone(),
+        totals: TsDailyTotals {
+            tokens: d.totals.tokens,
+            cost: d.totals.cost,
+            messages: d.totals.messages,
+            cost_is_complete: incomplete_cost_dates.contains(&d.date).then_some(false),
+        },
+        intensity: d.intensity,
+        token_breakdown: TsTokenBreakdown {
+            input: d.token_breakdown.input,
+            output: d.token_breakdown.output,
+            cache_read: d.token_breakdown.cache_read,
+            cache_write: d.token_breakdown.cache_write,
+            reasoning: d.token_breakdown.reasoning,
+        },
+        clients: d
+            .clients
+            .iter()
+            .map(|s| TsSourceContribution {
+                client: s.client.clone(),
+                model_id: s.model_id.clone(),
+                provider_id: if s.provider_id.is_empty() {
+                    None
+                } else {
+                    Some(s.provider_id.clone())
+                },
+                tokens: TsTokenBreakdown {
+                    input: s.tokens.input,
+                    output: s.tokens.output,
+                    cache_read: s.tokens.cache_read,
+                    cache_write: s.tokens.cache_write,
+                    reasoning: s.tokens.reasoning,
+                },
+                cost: s.cost,
+                messages: s.messages,
+            })
+            .collect(),
+        active_time_ms: d.active_time_ms,
+    }
+}
+
 fn to_ts_token_contribution_data(
     graph: &tokscale_core::GraphResult,
     device: Option<&device::SubmitDevice>,
@@ -5036,49 +5178,7 @@ fn to_ts_token_contribution_data(
         contributions: graph
             .contributions
             .iter()
-            .map(|d| TsDailyContribution {
-                date: d.date.clone(),
-                totals: TsDailyTotals {
-                    tokens: d.totals.tokens,
-                    cost: d.totals.cost,
-                    messages: d.totals.messages,
-                    cost_is_complete: graph
-                        .incomplete_cost_dates
-                        .contains(&d.date)
-                        .then_some(false),
-                },
-                intensity: d.intensity,
-                token_breakdown: TsTokenBreakdown {
-                    input: d.token_breakdown.input,
-                    output: d.token_breakdown.output,
-                    cache_read: d.token_breakdown.cache_read,
-                    cache_write: d.token_breakdown.cache_write,
-                    reasoning: d.token_breakdown.reasoning,
-                },
-                clients: d
-                    .clients
-                    .iter()
-                    .map(|s| TsSourceContribution {
-                        client: s.client.clone(),
-                        model_id: s.model_id.clone(),
-                        provider_id: if s.provider_id.is_empty() {
-                            None
-                        } else {
-                            Some(s.provider_id.clone())
-                        },
-                        tokens: TsTokenBreakdown {
-                            input: s.tokens.input,
-                            output: s.tokens.output,
-                            cache_read: s.tokens.cache_read,
-                            cache_write: s.tokens.cache_write,
-                            reasoning: s.tokens.reasoning,
-                        },
-                        cost: s.cost,
-                        messages: s.messages,
-                    })
-                    .collect(),
-                active_time_ms: d.active_time_ms,
-            })
+            .map(|d| to_ts_daily_contribution(d, &graph.incomplete_cost_dates))
             .collect(),
         time_metrics: graph.time_metrics.as_ref().map(|tm| TsTimeMetrics {
             total_active_time_ms: tm.total_active_time_ms,
@@ -5559,6 +5659,7 @@ fn format_duration_ms(ms: i64) -> String {
 
 #[allow(clippy::too_many_arguments)]
 fn run_graph_command(
+    source_snapshots: bool,
     output: Option<String>,
     home_dir: Option<String>,
     clients: Option<Vec<String>>,
@@ -5583,7 +5684,12 @@ fn run_graph_command(
     let rt = tokio::runtime::Runtime::new()?;
     let graph_result = rt
         .block_on(async {
-            generate_local_graph_report(context.report_options(GroupBy::default())).await
+            let options = context.report_options(GroupBy::default());
+            if source_snapshots {
+                tokscale_core::generate_source_snapshot_graph_report(options).await
+            } else {
+                generate_local_graph_report(options).await
+            }
         })
         .map_err(|e| anyhow::anyhow!(e))?;
     emit_cursor_sync_warning(
@@ -5594,8 +5700,9 @@ fn run_graph_command(
     emit_cursor_setup_warnings(&context.cursor_setup_warnings);
 
     let processing_time_ms = context.start.elapsed().as_millis() as u32;
-    let output_data = to_ts_token_contribution_data(&graph_result, None, None);
-    let json_output = serde_json::to_string_pretty(&output_data)?;
+    let export = to_ts_graph_export(&graph_result);
+    let json_output = serde_json::to_string_pretty(&export)?;
+    let output_data = &export.graph;
 
     if let Some(output_path) = output {
         std::fs::write(&output_path, json_output)?;
@@ -7746,6 +7853,7 @@ mod tests {
 
     fn graph_result_with_contributions(contributions: Vec<DailyContribution>) -> GraphResult {
         GraphResult {
+            source_usage: None,
             meta: GraphMeta {
                 generated_at: "2026-03-24T00:00:00Z".to_string(),
                 version: "test".to_string(),
@@ -7766,6 +7874,62 @@ mod tests {
             unpriced_submission_usage: Vec::new(),
             incomplete_cost_dates: std::collections::BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn source_snapshots_serialize_only_in_graph_export_not_submission_or_backfill() {
+        let mut graph = graph_result_with_contributions(vec![daily_contribution(
+            "2026-03-02",
+            10,
+            0.5,
+            "opencode",
+            "",
+        )]);
+        let normal = serde_json::to_value(to_ts_graph_export(&graph)).unwrap();
+        assert!(normal.get("sourceUsage").is_none());
+        graph.source_usage = Some(tokscale_core::SourceUsage {
+            version: 1,
+            event_identity_version: 1,
+            captured_at: "2026-03-02T00:00:00Z".into(),
+            full_history: true,
+            replacement_clients: vec!["opencode".into()],
+            partial_clients: Vec::new(),
+            bucket_timezone: "Etc/UTC".into(),
+            day_key: "2026-03-02".into(),
+            sessions: vec![tokscale_core::SourceSessionUsage {
+                client: "opencode".into(),
+                session_id: "session".into(),
+                days: graph.contributions.clone(),
+                events: vec![tokscale_core::SourceEventUsage {
+                    id: Some("sha256:fixture".into()),
+                    days: graph.contributions.clone(),
+                }],
+            }],
+            rows_without_identity: Default::default(),
+        });
+        let export = serde_json::to_value(to_ts_graph_export(&graph)).unwrap();
+        assert_eq!(
+            export["sourceUsage"]["sessions"][0]["days"][0],
+            export["contributions"][0]
+        );
+        assert_eq!(export["sourceUsage"]["eventIdentityVersion"], 1);
+        assert_eq!(
+            export["sourceUsage"]["replacementClients"],
+            serde_json::json!(["opencode"])
+        );
+        assert_eq!(
+            export["sourceUsage"]["sessions"][0]["events"][0]["days"][0],
+            export["contributions"][0]
+        );
+        assert_eq!(
+            export["sourceUsage"]["sessions"][0]["days"][0]["clients"][0]["modelId"],
+            ""
+        );
+        let submission =
+            serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
+        assert!(submission.get("sourceUsage").is_none());
+        let backfill = serde_json::to_value(backfill_payload(&graph, "fixture")).unwrap();
+        assert!(backfill.get("sourceUsage").is_none());
     }
 
     // Tests below call `build_client_filter_with_defaults` directly with

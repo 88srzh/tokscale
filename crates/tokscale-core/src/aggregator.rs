@@ -245,6 +245,7 @@ pub fn generate_graph_result(
         .unwrap_or_default();
 
     GraphResult {
+        source_usage: None,
         meta: GraphMeta {
             generated_at: chrono::Utc::now().to_rfc3339(),
             version: env!("CARGO_PKG_VERSION").to_string(),

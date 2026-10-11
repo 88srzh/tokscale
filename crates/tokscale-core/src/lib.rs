@@ -548,8 +548,50 @@ pub struct GraphMeta {
     pub processing_time_ms: u32,
 }
 
+/// A replaceable snapshot of the IDs and usage emitted by this parse, not a
+/// complete source inventory. Absence never proves a session was deleted.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceUsage {
+    pub version: u32,
+    /// Version of the digest namespace and per-event accounting contract.
+    pub event_identity_version: u32,
+    pub captured_at: String,
+    pub full_history: bool,
+    /// Literal non-synthetic selections with complete client-filter coverage.
+    /// Only these clients can use `full_history` for session replacement.
+    pub replacement_clients: Vec<String>,
+    /// Observed clients included only through a partial alias selection.
+    pub partial_clients: Vec<String>,
+    pub bucket_timezone: String,
+    pub day_key: String,
+    pub sessions: Vec<SourceSessionUsage>,
+    /// Parsed rows before date filtering, not token/message totals. Usage for
+    /// these rows remains in the aggregate graph, outside identified snapshots.
+    pub rows_without_identity: std::collections::BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceSessionUsage {
+    pub client: String,
+    pub session_id: String,
+    pub days: Vec<DailyContribution>,
+    pub events: Vec<SourceEventUsage>,
+}
+
+/// One existing scanner dedup identity's complete daily contribution group.
+/// A null ID holds all rows without a usable key; it is never an exact claim.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SourceEventUsage {
+    pub id: Option<String>,
+    pub days: Vec<DailyContribution>,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GraphResult {
+    #[serde(rename = "sourceUsage", skip_serializing_if = "Option::is_none")]
+    pub source_usage: Option<SourceUsage>,
     pub meta: GraphMeta,
     pub summary: DataSummary,
     pub years: Vec<YearSummary>,
@@ -5024,20 +5066,53 @@ enum GraphPricingRequirement {
     /// that arm everywhere pricing is decided. The single difference is that it
     /// does not take the recovery-overlay path in
     /// [`generate_graph_with_loaded_pricing`], so the graph contains only the
-    /// source messages on disk. Callers that compare a local scan against what
+    /// scanner-emitted messages, including retained source-cache history.
+    /// Callers that compare a local scan against what
     /// `tokscale submit` would send need this: the overlay is local-only and is
     /// never submitted, so counting it as "already reported" drops usage that
     /// nothing ever uploads.
     LenientSourceOnly,
+    /// Scanner-only graph with opt-in per-session and per-event daily folds.
+    LenientSourceSnapshots,
     Submission,
 }
 
 async fn generate_graph_with_loaded_pricing(
-    options: ReportOptions,
+    mut options: ReportOptions,
     pricing: Option<&pricing::PricingService>,
     pricing_requirement: GraphPricingRequirement,
 ) -> Result<GraphResult, String> {
     let start = Instant::now();
+    // Capture before parsing, then freeze the resolved bucket for this scan.
+    let source_usage = if matches!(
+        pricing_requirement,
+        GraphPricingRequirement::LenientSourceSnapshots
+    ) {
+        let captured_at = chrono::Utc::now();
+        let configured =
+            bucket_tz::BucketTimezone::from_scanner_settings(&options.scanner_settings);
+        let zone_name = configured.pinned_name().map(str::to_string)
+            .or_else(bucket_tz::detect_local_iana_name)
+            .ok_or_else(|| "cannot resolve the local bucket timezone for source snapshots; configure a named timezone".to_string())?;
+        options.scanner_settings.bucket_timezone = Some(zone_name.clone());
+        let zone = bucket_tz::BucketTimezone::from_pinned_name(Some(&zone_name));
+        Some(SourceUsage {
+            version: 1,
+            event_identity_version: 1,
+            captured_at: captured_at.to_rfc3339(),
+            full_history: options.since.is_none()
+                && options.until.is_none()
+                && options.year.is_none(),
+            replacement_clients: source_replacement_clients(options.clients.as_deref()),
+            partial_clients: Vec::new(),
+            bucket_timezone: zone_name,
+            day_key: zone.day_key(captured_at.timestamp_millis()),
+            sessions: Vec::new(),
+            rows_without_identity: std::collections::BTreeMap::new(),
+        })
+    } else {
+        None
+    };
 
     let home_dir = get_home_dir_string(&options.home_dir)?;
 
@@ -5058,6 +5133,9 @@ async fn generate_graph_with_loaded_pricing(
     // applies the same date filters per message and drops each one after it
     // has landed in the day map and produced its session span.
     let mut sink = GraphSink::new(Some(&options), pricing, pricing_requirement);
+    if let Some(source_usage) = source_usage {
+        sink.enable_source_snapshots(source_usage);
+    }
     if matches!(pricing_requirement, GraphPricingRequirement::Lenient)
         && recovery::applicable(&home_dir)
     {
@@ -5115,6 +5193,8 @@ struct GraphSink<'a> {
     requirement: GraphPricingRequirement,
     buffer: Vec<UnifiedMessage>,
     daily: aggregator::DailyFold,
+    source_usage: Option<SourceUsage>,
+    source_daily: Option<BTreeMap<(String, String), SourceSessionFold>>,
     interner: sessionize::SpanInterner,
     spans: Vec<sessionize::SessionSpan>,
     /// Merged across batches by (provider, model); counts and tokens add.
@@ -5123,6 +5203,63 @@ struct GraphSink<'a> {
     /// First batch error, surfaced from `finish` so the outcome matches the
     /// whole-corpus path's `?` on the first failure.
     failure: Option<String>,
+}
+
+#[derive(Default)]
+struct SourceSessionFold {
+    daily: aggregator::DailyFold,
+    // No message vectors: O(distinct event/day/model contribution tuples),
+    // with a BTreeMap providing deterministic event ordering across batches.
+    events: BTreeMap<Option<String>, aggregator::DailyFold>,
+}
+
+fn source_replacement_clients(clients: Option<&[String]>) -> Vec<String> {
+    let selected: BTreeSet<String> = match clients.filter(|clients| !clients.is_empty()) {
+        None => ClientId::ALL
+            .iter()
+            .map(|client| client.as_str().to_string())
+            .collect(),
+        Some(clients) => clients
+            .iter()
+            .filter(|client| {
+                ClientId::from_str(client).is_some()
+                    || client.eq_ignore_ascii_case("9router")
+                    || token_monitor::client_ids().any(|id| id == client.as_str())
+            })
+            .cloned()
+            .collect(),
+    };
+    selected.into_iter().collect()
+}
+
+fn source_client_has_replacement_scope(client: &str, replacement_clients: &[String]) -> bool {
+    replacement_clients.iter().any(|selected| {
+        selected.eq_ignore_ascii_case(client)
+            || (selected == "claude" && client.starts_with("cc-mirror/"))
+            || (selected == "gjc" && client.eq_ignore_ascii_case("9router"))
+    })
+}
+
+/// Match the scanner's shared dedup lanes, not the current winning owner.
+/// Independent clients that merely reuse a response ID stay separate.
+fn source_event_id(message: &UnifiedMessage) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let key = message
+        .dedup_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())?;
+    let family = match message.client.as_str() {
+        "antigravity" | "antigravity-cli" | "antigravity-extension" => "antigravity",
+        client if client.eq_ignore_ascii_case("9router") => "gjc",
+        client if client.starts_with("cc-mirror/") => "claude",
+        client => client,
+    };
+    let mut digest = Sha256::new();
+    digest.update(b"tokscale-source-event-v1\0");
+    digest.update((family.len() as u64).to_be_bytes());
+    digest.update(family.as_bytes());
+    digest.update(key.as_bytes());
+    Some(format!("sha256:{:x}", digest.finalize()))
 }
 
 impl<'a> GraphSink<'a> {
@@ -5137,12 +5274,23 @@ impl<'a> GraphSink<'a> {
             requirement,
             buffer: Vec::new(),
             daily: aggregator::DailyFold::default(),
+            source_usage: None,
+            source_daily: None,
             interner: sessionize::SpanInterner::default(),
             spans: Vec::new(),
             unpriced_usage: HashMap::new(),
             incomplete_cost_dates: BTreeSet::new(),
             failure: None,
         }
+    }
+
+    fn enable_source_snapshots(&mut self, source_usage: SourceUsage) {
+        assert!(matches!(
+            self.requirement,
+            GraphPricingRequirement::LenientSourceSnapshots
+        ));
+        self.source_usage = Some(source_usage);
+        self.source_daily = Some(std::collections::BTreeMap::new());
     }
 
     fn drain_batch(&mut self) {
@@ -5155,7 +5303,9 @@ impl<'a> GraphSink<'a> {
             // `LenientSourceOnly` differs from `Lenient` only in which messages
             // reach the sink (no recovery overlay), never in how they are
             // priced, so the two share this arm.
-            GraphPricingRequirement::Lenient | GraphPricingRequirement::LenientSourceOnly => batch,
+            GraphPricingRequirement::Lenient
+            | GraphPricingRequirement::LenientSourceOnly
+            | GraphPricingRequirement::LenientSourceSnapshots => batch,
             GraphPricingRequirement::Submission => {
                 let (mut submitted, zeroed, unpriced_usage, incomplete_cost_dates) =
                     prepare_submission_pricing(batch, self.pricing);
@@ -5184,6 +5334,19 @@ impl<'a> GraphSink<'a> {
 
         for message in &batch {
             self.daily.add(message);
+            if let Some(sessions) = &mut self.source_daily {
+                if has_source_session_identity(message) {
+                    let session = sessions
+                        .entry((message.client.clone(), message.session_id.clone()))
+                        .or_default();
+                    session.daily.add(message);
+                    session
+                        .events
+                        .entry(source_event_id(message))
+                        .or_default()
+                        .add(message);
+                }
+            }
             if message.timestamp > 0 {
                 self.spans.push(sessionize::SessionSpan::from_message(
                     message,
@@ -5242,6 +5405,27 @@ impl<'a> GraphSink<'a> {
 
         let processing_time_ms = start.elapsed().as_millis() as u32;
         let mut result = aggregator::generate_graph_result(contributions, processing_time_ms);
+        if let Some(mut source_usage) = self.source_usage {
+            source_usage.sessions = self
+                .source_daily
+                .unwrap_or_default()
+                .into_iter()
+                .map(|((client, session_id), fold)| SourceSessionUsage {
+                    client,
+                    session_id,
+                    days: fold.daily.finish(),
+                    events: fold
+                        .events
+                        .into_iter()
+                        .map(|(id, daily)| SourceEventUsage {
+                            id,
+                            days: daily.finish(),
+                        })
+                        .collect(),
+                })
+                .collect();
+            result.source_usage = Some(source_usage);
+        }
         result.time_metrics = Some(time_metrics);
         result.unpriced_submission_usage = unpriced_submission_usage;
         result.incomplete_cost_dates = self.incomplete_cost_dates;
@@ -5256,8 +5440,41 @@ impl<'a> GraphSink<'a> {
     }
 }
 
+// Several parsers represent a null/missing ID with this legacy sentinel.
+// Keep that usage in the normal graph, but never treat it as one real session.
+fn has_source_session_identity(message: &UnifiedMessage) -> bool {
+    !message.session_id.trim().is_empty()
+        && message.session_id != "unknown"
+        && !(message.client == "copilot" && message.session_id == "unknown-session")
+}
+
 impl MessageSink for GraphSink<'_> {
     fn accept(&mut self, message: UnifiedMessage) {
+        // Observe parsed identities even when every row falls outside the
+        // requested window. Never invent IDs for sources the parser omitted.
+        if let (Some(source_usage), Some(sessions)) =
+            (&mut self.source_usage, &mut self.source_daily)
+        {
+            if !source_client_has_replacement_scope(
+                &message.client,
+                &source_usage.replacement_clients,
+            ) && !source_usage.partial_clients.contains(&message.client)
+            {
+                source_usage.partial_clients.push(message.client.clone());
+                source_usage.partial_clients.sort();
+            }
+            if !has_source_session_identity(&message) {
+                let rows = source_usage
+                    .rows_without_identity
+                    .entry(message.client.clone())
+                    .or_default();
+                *rows = rows.saturating_add(1);
+            } else {
+                sessions
+                    .entry((message.client.clone(), message.session_id.clone()))
+                    .or_default();
+            }
+        }
         if let Some(options) = self.filter {
             if !message_passes_report_filter(&message, options) {
                 return;
@@ -5539,6 +5756,21 @@ pub async fn generate_source_graph_report(options: ReportOptions) -> Result<Grap
         options,
         pricing.as_deref(),
         GraphPricingRequirement::LenientSourceOnly,
+    )
+    .await
+}
+
+/// Opt-in local export of source-only per-session usage snapshots. Neither
+/// submission nor recovery callers enable these folds. A full-history flag
+/// describes date coverage only; omitted parser output is not deletion proof.
+pub async fn generate_source_snapshot_graph_report(
+    options: ReportOptions,
+) -> Result<GraphResult, String> {
+    let pricing = load_pricing_for_local_parse().await;
+    generate_graph_with_loaded_pricing(
+        options,
+        pricing.as_deref(),
+        GraphPricingRequirement::LenientSourceSnapshots,
     )
     .await
 }
@@ -7456,6 +7688,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
 
 #[cfg(test)]
 mod tests {
+    mod source_snapshots;
     mod window_dates;
     mod window_pricing;
 
@@ -18620,13 +18853,28 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let graph = runtime
             .block_on(generate_graph_with_loaded_pricing(
-                options,
+                options.clone(),
                 Some(&pricing),
                 GraphPricingRequirement::Lenient,
             ))
             .unwrap();
         assert_eq!(graph.summary.total_tokens, 1500);
         assert_eq!(graph.summary.total_cost, 2.0);
+        let source_graph = runtime
+            .block_on(generate_graph_with_loaded_pricing(
+                ReportOptions {
+                    scanner_settings: scanner::ScannerSettings {
+                        bucket_timezone: Some("Etc/UTC".into()),
+                        ..Default::default()
+                    },
+                    ..options
+                },
+                Some(&pricing),
+                GraphPricingRequirement::LenientSourceSnapshots,
+            ))
+            .unwrap();
+        assert_eq!(source_graph.summary.total_tokens, 0);
+        assert!(source_graph.source_usage.unwrap().sessions.is_empty());
         let original: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(original["messages"][0]["cost"], 99.0);
