@@ -548,45 +548,13 @@ pub struct GraphMeta {
     pub processing_time_ms: u32,
 }
 
-/// A replaceable snapshot of the IDs and usage emitted by this parse, not a
-/// complete source inventory. Absence never proves a session was deleted.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SourceUsage {
-    pub version: u32,
-    /// Version of the digest namespace and per-event accounting contract.
-    pub event_identity_version: u32,
-    pub captured_at: String,
-    pub full_history: bool,
-    /// Literal non-synthetic selections with complete client-filter coverage.
-    /// Only these clients can use `full_history` for session replacement.
-    pub replacement_clients: Vec<String>,
-    /// Observed clients included only through a partial alias selection.
-    pub partial_clients: Vec<String>,
-    pub bucket_timezone: String,
-    pub day_key: String,
-    pub sessions: Vec<SourceSessionUsage>,
-    /// Parsed rows before date filtering, not token/message totals. Usage for
-    /// these rows remains in the aggregate graph, outside identified snapshots.
-    pub rows_without_identity: std::collections::BTreeMap<String, u64>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SourceSessionUsage {
-    pub client: String,
-    pub session_id: String,
-    pub days: Vec<DailyContribution>,
-    pub events: Vec<SourceEventUsage>,
-}
-
-/// One existing scanner dedup identity's complete daily contribution group.
-/// A null ID holds all rows without a usable key; it is never an exact claim.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SourceEventUsage {
-    pub id: Option<String>,
-    pub days: Vec<DailyContribution>,
-}
+mod source_snapshot;
+use source_snapshot::{
+    source_dedup_domain, source_event_id, source_scope_id, SourceReadEvidence, SourceScopeFold,
+};
+pub use source_snapshot::{
+    SourceContribution, SourceEventUsage, SourceScopeUsage, SourceSessionUsage, SourceUsage,
+};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GraphResult {
@@ -998,6 +966,10 @@ fn opencode_json_superseded_by_sqlite(
 /// Callers that genuinely want the whole vector still get one: `Vec` is a sink.
 trait MessageSink {
     fn accept(&mut self, message: UnifiedMessage);
+    fn wants_source_evidence(&self) -> bool {
+        false
+    }
+    fn observe_source(&mut self, _evidence: SourceReadEvidence) {}
 }
 
 impl MessageSink for Vec<UnifiedMessage> {
@@ -1014,6 +986,13 @@ struct CustomPricingSink<'a, S> {
 }
 
 impl<S: MessageSink> MessageSink for CustomPricingSink<'_, S> {
+    fn wants_source_evidence(&self) -> bool {
+        self.sink.wants_source_evidence()
+    }
+    fn observe_source(&mut self, evidence: SourceReadEvidence) {
+        self.sink.observe_source(evidence);
+    }
+
     fn accept(&mut self, mut message: UnifiedMessage) {
         apply_custom_pricing_if_available(&mut message, self.pricing);
         self.sink.accept(message);
@@ -2005,6 +1984,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
                         messages: entry.messages,
                         metadata: entry.micode_metadata.take().unwrap_or_default(),
                         complete: true,
+                        observed_sessions: Vec::new(),
                     },
                     None,
                     false,
@@ -2386,11 +2366,35 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // OpenCode is the largest lane; release it before MiMo Code starts.
     flush_lane(&mut all_messages, &flush_context, sink);
 
+    let source_evidence = sink.wants_source_evidence();
+    let mut micode_evidence = SourceReadEvidence::new(
+        "micode",
+        !scan_result
+            .source_read_failures
+            .contains(&ClientId::MiMoCode)
+            && !scan_result
+                .source_read_failures
+                .contains(&ClientId::MiMoDesktop),
+        true,
+    );
     let mut micode_messages = sessions::micode::MiMoMessages::default();
 
     for db_path in &scan_result.micode_dbs {
         // Pricing happens only after raw source identities are reconciled.
-        let (source, cache_entry, invalidate) = load_or_parse_micode_source(db_path, &source_cache);
+        let (source, cache_entry, invalidate) = if source_evidence {
+            // Old cache envelopes have no session inventory/read proof. Pair
+            // fresh evidence with fresh rows, never upgrade a cache hit to complete.
+            let before = message_cache::SourceFingerprint::from_sqlite_path_exact(db_path);
+            let source = sessions::micode::parse_micode_source(db_path);
+            let after = message_cache::SourceFingerprint::from_sqlite_path_exact(db_path);
+            micode_evidence.complete &= source.complete && before.is_some() && before == after;
+            micode_evidence
+                .sessions
+                .extend(source.observed_sessions.clone());
+            (source, None, false)
+        } else {
+            load_or_parse_micode_source(db_path, &source_cache)
+        };
         micode_messages.extend(db_path, source);
         if let Some(entry) = cache_entry {
             source_cache.insert(entry);
@@ -2404,7 +2408,12 @@ fn parse_all_messages_streaming<S: MessageSink>(
 
     // Buffer the whole shared store before choosing ownership: the original
     // session can be in a database discovered after a fork's copied history.
-    for mut message in micode_messages.into_messages() {
+    let (micode_rows, identity_exact) = micode_messages.into_messages_with_identity();
+    if source_evidence {
+        micode_evidence.identity_exact = identity_exact;
+        sink.observe_source(micode_evidence);
+    }
+    for mut message in micode_rows {
         apply_pricing_if_available(&mut message, pricing);
         flush_message(message, &flush_context, sink);
     }
@@ -2493,24 +2502,84 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // and the flush filter decides — a `synthetic` request keeps the ones a
     // synthetic gateway served, whether or not codex was asked for by name.
     let mut recorded_codex_turns = RecordedCodexTurns::default();
-    let codex_outcomes: Vec<(PathBuf, CodexSourceOutcome)> = scan_result
-        .get(ClientId::Codex)
-        .par_iter()
-        .map(|path| {
-            (
-                path.clone(),
-                load_or_parse_codex_source(
-                    path,
-                    &source_cache,
-                    pricing,
-                    price_window,
-                    &headless_roots,
-                ),
-            )
-        })
-        .collect();
+    let mut codex_evidence = SourceReadEvidence::new(
+        "codex",
+        !scan_result.source_read_failures.contains(&ClientId::Codex),
+        true,
+    );
+    let codex_outcomes: Vec<(PathBuf, CodexSourceOutcome, Option<SourceReadEvidence>)> =
+        scan_result
+            .get(ClientId::Codex)
+            .par_iter()
+            .map(|path| {
+                if source_evidence {
+                    let before = message_cache::SourceFingerprint::from_path(path);
+                    let parsed = sessions::codex::parse_codex_file_for_source(path);
+                    let after = message_cache::SourceFingerprint::from_path(path);
+                    let mut evidence = SourceReadEvidence::new(
+                        "codex",
+                        parsed.source_read_succeeded
+                            && !parsed.unresolved_model_events
+                            && before.is_some()
+                            && before == after,
+                        true,
+                    );
+                    // Path-based IDs are the IDs used by native Codex rows. Only a
+                    // decoded session_meta proves an empty session was observed.
+                    if parsed
+                        .state
+                        .session_id_from_meta
+                        .as_deref()
+                        .is_some_and(|id| source_snapshot::has_session_identity("codex", id))
+                        && !parsed.state.session_owned_by_openclaw
+                    {
+                        evidence
+                            .sessions
+                            .push(("codex".into(), sessions::utils::session_id_from_path(path)));
+                    }
+                    let coverage = parsed.state.turn_coverage.clone();
+                    let messages = finalize_codex_messages(
+                        parsed.messages,
+                        pricing,
+                        is_headless_path(path, &headless_roots),
+                        &parsed.fallback_timestamp_indices,
+                        sessions::utils::file_modified_timestamp_ms(path),
+                        None,
+                    );
+                    (
+                        path.clone(),
+                        (
+                            CachedParseOutcome {
+                                messages,
+                                retained_message_keys: HashSet::new(),
+                                cache_entry: None,
+                                invalidate_cache: false,
+                            },
+                            coverage,
+                        ),
+                        Some(evidence),
+                    )
+                } else {
+                    (
+                        path.clone(),
+                        load_or_parse_codex_source(
+                            path,
+                            &source_cache,
+                            pricing,
+                            price_window,
+                            &headless_roots,
+                        ),
+                        None,
+                    )
+                }
+            })
+            .collect();
     let mut codex_seen: HashSet<String> = HashSet::new();
-    for (path, (outcome, turn_coverage)) in codex_outcomes {
+    for (path, (outcome, turn_coverage), evidence) in codex_outcomes {
+        if let Some(evidence) = evidence {
+            codex_evidence.complete &= evidence.complete;
+            codex_evidence.sessions.extend(evidence.sessions);
+        }
         let mut owned_thread: Option<String> = None;
         let mut counted_under_codex = false;
         for message in outcome.messages {
@@ -2545,6 +2614,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 &path,
             );
         }
+    }
+
+    if source_evidence {
+        sink.observe_source(codex_evidence);
     }
 
     // Release Codex before Copilot. This has to sit ahead of the Copilot
@@ -5041,8 +5114,8 @@ async fn generate_graph_with_loaded_pricing(
         options.scanner_settings.bucket_timezone = Some(zone_name.clone());
         let zone = bucket_tz::BucketTimezone::from_pinned_name(Some(&zone_name));
         Some(SourceUsage {
-            version: 1,
-            event_identity_version: 1,
+            version: 2,
+            event_identity_version: 2,
             captured_at: captured_at.to_rfc3339(),
             full_history: options.since.is_none()
                 && options.until.is_none()
@@ -5052,6 +5125,7 @@ async fn generate_graph_with_loaded_pricing(
             bucket_timezone: zone_name,
             day_key: zone.day_key(captured_at.timestamp_millis()),
             sessions: Vec::new(),
+            scopes: Vec::new(),
             rows_without_identity: std::collections::BTreeMap::new(),
         })
     } else {
@@ -5139,6 +5213,7 @@ struct GraphSink<'a> {
     daily: aggregator::DailyFold,
     source_usage: Option<SourceUsage>,
     source_daily: Option<BTreeMap<(String, String), SourceSessionFold>>,
+    source_scopes: BTreeMap<String, SourceScopeFold>,
     interner: sessionize::SpanInterner,
     spans: Vec<sessionize::SessionSpan>,
     /// Merged across batches by (provider, model); counts and tokens add.
@@ -5151,10 +5226,46 @@ struct GraphSink<'a> {
 
 #[derive(Default)]
 struct SourceSessionFold {
-    daily: aggregator::DailyFold,
-    // No message vectors: O(distinct event/day/model contribution tuples),
-    // with a BTreeMap providing deterministic event ordering across batches.
-    events: BTreeMap<Option<String>, aggregator::DailyFold>,
+    // No duplicated daily accounting or whole message vectors.
+    events: BTreeMap<Option<String>, SourceContributionFold>,
+}
+
+type SourceContributionFold = BTreeMap<(i64, String, String), SourceContribution>;
+
+/// A source group is one complete event claim even when native token_count
+/// dedup left different contributions under different rollout owners.
+fn consolidate_codex_source_groups(sessions: &mut BTreeMap<(String, String), SourceSessionFold>) {
+    let mut groups: BTreeMap<String, ((String, String), SourceContributionFold)> = BTreeMap::new();
+    for (owner, session) in sessions.iter_mut().filter(|(owner, _)| owner.0 == "codex") {
+        let events = std::mem::take(&mut session.events);
+        for (id, contributions) in events {
+            let Some(id) = id else {
+                session.events.insert(None, contributions);
+                continue;
+            };
+            // BTreeMap iteration chooses the first raw owner deterministically.
+            let (_, group) = groups
+                .entry(id)
+                .or_insert_with(|| (owner.clone(), BTreeMap::new()));
+            for (key, contribution) in contributions {
+                match group.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(contribution);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().merge(contribution);
+                    }
+                }
+            }
+        }
+    }
+    for (id, (owner, contributions)) in groups {
+        sessions
+            .get_mut(&owner)
+            .expect("observed group owner exists")
+            .events
+            .insert(Some(id), contributions);
+    }
 }
 
 fn source_replacement_clients(clients: Option<&[String]>) -> Vec<String> {
@@ -5184,28 +5295,6 @@ fn source_client_has_replacement_scope(client: &str, replacement_clients: &[Stri
     })
 }
 
-/// Match the scanner's shared dedup lanes, not the current winning owner.
-/// Independent clients that merely reuse a response ID stay separate.
-fn source_event_id(message: &UnifiedMessage) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    let key = message
-        .dedup_key
-        .as_deref()
-        .filter(|key| !key.trim().is_empty())?;
-    let family = match message.client.as_str() {
-        "antigravity" | "antigravity-cli" | "antigravity-extension" => "antigravity",
-        client if client.eq_ignore_ascii_case("9router") => "gjc",
-        client if client.starts_with("cc-mirror/") => "claude",
-        client => client,
-    };
-    let mut digest = Sha256::new();
-    digest.update(b"tokscale-source-event-v1\0");
-    digest.update((family.len() as u64).to_be_bytes());
-    digest.update(family.as_bytes());
-    digest.update(key.as_bytes());
-    Some(format!("sha256:{:x}", digest.finalize()))
-}
-
 impl<'a> GraphSink<'a> {
     fn new(
         filter: Option<&'a ReportOptions>,
@@ -5220,6 +5309,7 @@ impl<'a> GraphSink<'a> {
             daily: aggregator::DailyFold::default(),
             source_usage: None,
             source_daily: None,
+            source_scopes: BTreeMap::new(),
             interner: sessionize::SpanInterner::default(),
             spans: Vec::new(),
             unpriced_usage: HashMap::new(),
@@ -5233,6 +5323,13 @@ impl<'a> GraphSink<'a> {
             self.requirement,
             GraphPricingRequirement::LenientSourceSnapshots
         ));
+        for client in &source_usage.replacement_clients {
+            self.source_scopes
+                .entry(source_dedup_domain(client).to_string())
+                .or_default()
+                .clients
+                .insert(client.clone());
+        }
         self.source_usage = Some(source_usage);
         self.source_daily = Some(std::collections::BTreeMap::new());
     }
@@ -5283,12 +5380,17 @@ impl<'a> GraphSink<'a> {
                     let session = sessions
                         .entry((message.client.clone(), message.session_id.clone()))
                         .or_default();
-                    session.daily.add(message);
-                    session
+                    let contribution = session
                         .events
                         .entry(source_event_id(message))
                         .or_default()
-                        .add(message);
+                        .entry((
+                            message.timestamp,
+                            canonical_model_id(&message.model_id),
+                            message.provider_id.clone(),
+                        ))
+                        .or_insert_with(|| SourceContribution::from_message(message));
+                    contribution.add(message);
                 }
             }
             if message.timestamp > 0 {
@@ -5350,24 +5452,39 @@ impl<'a> GraphSink<'a> {
         let processing_time_ms = start.elapsed().as_millis() as u32;
         let mut result = aggregator::generate_graph_result(contributions, processing_time_ms);
         if let Some(mut source_usage) = self.source_usage {
-            source_usage.sessions = self
-                .source_daily
-                .unwrap_or_default()
+            let mut sessions = self.source_daily.unwrap_or_default();
+            consolidate_codex_source_groups(&mut sessions);
+            source_usage.sessions = sessions
                 .into_iter()
                 .map(|((client, session_id), fold)| SourceSessionUsage {
+                    scope_id: source_scope_id(&client),
                     client,
                     session_id,
-                    days: fold.daily.finish(),
                     events: fold
                         .events
                         .into_iter()
-                        .map(|(id, daily)| SourceEventUsage {
+                        .map(|(id, contributions)| SourceEventUsage {
                             id,
-                            days: daily.finish(),
+                            contributions: contributions.into_values().collect(),
                         })
                         .collect(),
                 })
                 .collect();
+            source_usage.scopes = self
+                .source_scopes
+                .into_iter()
+                .map(|(domain, fold)| fold.finish(&domain, &source_usage.replacement_clients))
+                .collect();
+            for scope in &source_usage.scopes {
+                if !source_snapshot::scope_has_selection_coverage(
+                    scope,
+                    &source_usage.replacement_clients,
+                ) {
+                    source_usage.partial_clients.extend(scope.clients.clone());
+                }
+            }
+            source_usage.partial_clients.sort();
+            source_usage.partial_clients.dedup();
             result.source_usage = Some(source_usage);
         }
         result.time_metrics = Some(time_metrics);
@@ -5393,9 +5510,52 @@ fn has_source_session_identity(message: &UnifiedMessage) -> bool {
 }
 
 impl MessageSink for GraphSink<'_> {
+    fn wants_source_evidence(&self) -> bool {
+        self.source_usage.is_some()
+    }
+    fn observe_source(&mut self, evidence: SourceReadEvidence) {
+        let Some(source) = &self.source_usage else {
+            return;
+        };
+        // Do not export inventories of unselected surfaces or synthetic-only
+        // subsets as empty full sessions.
+        let selected = source
+            .replacement_clients
+            .iter()
+            .any(|client| source_dedup_domain(client) == evidence.domain);
+        if !selected {
+            return;
+        }
+        let scope = self
+            .source_scopes
+            .entry(evidence.domain.clone())
+            .or_default();
+        scope.observe(&evidence);
+        if let Some(sessions) = &mut self.source_daily {
+            for (client, id) in evidence.sessions {
+                if source_client_has_replacement_scope(&client, &source.replacement_clients)
+                    && source_snapshot::has_session_identity(&client, &id)
+                {
+                    scope.clients.insert(client.clone());
+                    sessions.entry((client, id)).or_default();
+                }
+            }
+        }
+    }
+
     fn accept(&mut self, message: UnifiedMessage) {
         // Observe parsed identities even when every row falls outside the
         // requested window. Never invent IDs for sources the parser omitted.
+        if self.source_usage.is_some() {
+            let scope = self
+                .source_scopes
+                .entry(source_dedup_domain(&message.client).into())
+                .or_default();
+            scope.clients.insert(message.client.clone());
+            scope.unresolved_rows |= source_event_id(&message).is_none()
+                || !has_source_session_identity(&message)
+                || message.timestamp <= 0;
+        }
         if let (Some(source_usage), Some(sessions)) =
             (&mut self.source_usage, &mut self.source_daily)
         {
@@ -7605,6 +7765,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
         message_count: msg.message_count,
         agent: msg.agent.clone(),
         dedup_key: None,
+        source_group_key: None,
         session_title: None,
         parent_session_id: None,
         is_turn_start: false,

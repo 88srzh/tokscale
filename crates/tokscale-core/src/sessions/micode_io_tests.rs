@@ -367,6 +367,113 @@ async fn micode_metadata_read_failure_stays_cold_until_successfully_repaired() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn micode_invalid_accounting_invalidates_warm_cache_until_repaired() {
+    use crate::message_cache::{
+        CacheIdentity, CachedSourceEntry, SourceFingerprint, SourceMessageCache,
+    };
+    let home = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let _env = cache_env(cache.path());
+    let path = fixture(home.path());
+    parse_local_unified_messages_with_pricing(options(home.path()), None)
+        .await
+        .unwrap();
+    reset();
+    parse_local_unified_messages_with_pricing(options(home.path()), None)
+        .await
+        .unwrap();
+    assert_eq!(counts(), IoCounts::default());
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE message SET data=json_set(data,'$.tokens.input',-30,'$.tokens.output',15)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(!parse_micode_source(&path).complete);
+    for _ in 0..2 {
+        reset();
+        let native = parse_local_unified_messages_with_pricing(options(home.path()), None)
+            .await
+            .unwrap();
+        assert_eq!(native.iter().map(|m| m.tokens.total()).sum::<i64>(), 30);
+        assert_single_read(2);
+        assert!(
+            SourceMessageCache::load()
+                .take(CacheIdentity::for_client(crate::ClientId::MiMoCode), &path)
+                .is_none(),
+            "partial rows cannot acquire a complete cache payload"
+        );
+    }
+    // Simulate a pre-fix envelope that admitted these byte-identical clamped
+    // rows. Native cache hits remain compatible, but export must re-read them.
+    let source = parse_micode_source(&path);
+    let entry = CachedSourceEntry::new(
+        CacheIdentity::for_client(crate::ClientId::MiMoCode),
+        &path,
+        SourceFingerprint::from_sqlite_path(&path).unwrap(),
+        source.messages,
+        Vec::new(),
+        None,
+    )
+    .with_micode_metadata(source.metadata);
+    let mut stored = SourceMessageCache::load();
+    stored.insert(entry);
+    stored.save_if_dirty();
+    reset();
+    let warm = parse_local_unified_messages_with_pricing(options(home.path()), None)
+        .await
+        .unwrap();
+    assert_eq!(warm.iter().map(|m| m.tokens.total()).sum::<i64>(), 30);
+    assert_eq!(counts(), IoCounts::default());
+    reset();
+    let report = crate::generate_graph_with_loaded_pricing(
+        crate::ReportOptions {
+            home_dir: options(home.path()).home_dir,
+            clients: options(home.path()).clients,
+            scanner_settings: crate::scanner::ScannerSettings {
+                bucket_timezone: Some("Etc/UTC".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        None,
+        crate::GraphPricingRequirement::LenientSourceSnapshots,
+    )
+    .await
+    .unwrap();
+    assert_single_read(2);
+    assert_eq!(
+        serde_json::to_value(report.source_usage.unwrap()).unwrap()["scopes"][0]["readStatus"],
+        "partial",
+        "a pre-fix warm envelope cannot supply source-read authority"
+    );
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE message SET data=json_set(data,'$.tokens.input',0)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    assert!(parse_micode_source(&path).complete);
+    reset();
+    parse_local_unified_messages_with_pricing(options(home.path()), None)
+        .await
+        .unwrap();
+    assert_single_read(2);
+    reset();
+    parse_local_unified_messages_with_pricing(options(home.path()), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        counts(),
+        IoCounts::default(),
+        "a valid repaired source should become warm again"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn micode_structurally_legacy_session_metadata_remains_cacheable() {
     for schema in [
         "DROP TABLE session;",

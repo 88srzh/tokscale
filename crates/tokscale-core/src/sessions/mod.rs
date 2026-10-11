@@ -101,6 +101,10 @@ pub struct UnifiedMessage {
     pub message_count: i32,
     pub agent: Option<String>,
     pub dedup_key: Option<String>,
+    /// Export-only stable source group. Codex stores it beside messages in its
+    /// own cache envelope; it never participates in normal scanner dedup.
+    #[serde(skip)]
+    pub source_group_key: Option<String>,
     /// Human-readable session title/name when the source client stores one
     /// (e.g. OpenCode's `session.title` column). `None` for clients that
     /// don't record a title; the Sessions tab falls back to showing just
@@ -398,6 +402,7 @@ impl UnifiedMessage {
             message_count: default_message_count(),
             agent,
             dedup_key,
+            source_group_key: None,
             session_title: None,
             parent_session_id: None,
             is_turn_start: false,

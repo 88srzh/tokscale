@@ -92,6 +92,8 @@ pub struct CrushDbSource {
 #[derive(Debug)]
 pub struct ScanResult {
     pub files: [Vec<PathBuf>; ClientId::COUNT],
+    /// Known directory traversal failures, independent of discovered files.
+    pub(crate) source_read_failures: HashSet<ClientId>,
     /// All OpenCode SQLite databases discovered under the data dir.
     ///
     /// Includes the default `opencode.db` (used by `latest`/`beta` channels
@@ -141,6 +143,7 @@ impl Default for ScanResult {
     fn default() -> Self {
         Self {
             files: std::array::from_fn(|_| Vec::new()),
+            source_read_failures: HashSet::new(),
             opencode_dbs: Vec::new(),
             copilot_desktop_db: None,
             copilot_session_store_db: None,
@@ -438,9 +441,15 @@ fn is_openclaw_compaction_checkpoint(file_name: &str) -> bool {
 
 /// Scan a single directory for session files
 pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
-    if !std::path::Path::new(root).exists() {
-        return Vec::new();
+    scan_directory_with_health(root, pattern).0
+}
+
+fn scan_directory_with_health(root: &str, pattern: &str) -> (Vec<PathBuf>, bool) {
+    match std::fs::metadata(root) {
+        Ok(_) => {}
+        Err(error) => return (Vec::new(), error.kind() == std::io::ErrorKind::NotFound),
     }
+    let mut complete = true;
 
     // #1153: `~/.config/Code/logs` can hold tens of thousands of entries
     // (34,598 measured) from many extensions. The `codebuddy-extension-log`
@@ -471,7 +480,13 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 || e.file_name()
                     .eq_ignore_ascii_case("Tencent-Cloud.coding-copilot")
         })
-        .filter_map(|e| e.ok())
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(_) => {
+                complete = false;
+                None
+            }
+        })
         .filter(|e| {
             let path = e.path();
             // WalkDir already knows the entry type from the directory read, so
@@ -693,7 +708,7 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
     // requirement for PathBuf) and avoids allocation. Note: ordering is byte-lexical,
     // not case-normalized (known Windows/macOS caveat for mixed-case paths).
     paths.sort_unstable();
-    paths
+    (paths, complete)
 }
 
 /// Parse a `TOKSCALE_EXTRA_DIRS`-formatted string into (ClientId, path) pairs.
@@ -1265,30 +1280,44 @@ fn is_opencode_db_filename(name: &str) -> bool {
 /// Matches `mimocode.db` and `mimocode-<channel>.db` (channel names
 /// sanitized with the same `[a-zA-Z0-9._-]` character class that MiMo
 /// Code's `getChannelPath` normalizes to). Ignores WAL/SHM sidecar files.
+#[cfg(test)]
 pub(crate) fn discover_micode_dbs(data_dir: &Path) -> Vec<PathBuf> {
+    discover_micode_dbs_with_health(data_dir).0
+}
+
+fn discover_micode_dbs_with_health(data_dir: &Path) -> (Vec<PathBuf>, bool) {
+    let mut complete = true;
     let entries = match std::fs::read_dir(data_dir) {
         Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+        Err(error) => return (Vec::new(), error.kind() == std::io::ErrorKind::NotFound),
     };
 
-    let mut dbs: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let file_type = entry.file_type().ok()?;
-            if !file_type.is_file() && !entry.path().is_file() {
-                return None;
+    let mut dbs = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                complete = false;
+                continue;
             }
-            let path = entry.path();
-            let name = path.file_name()?.to_str()?;
-            if !is_micode_db_filename(name) {
-                return None;
-            }
-            Some(path)
-        })
-        .collect();
+        };
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_micode_db_filename)
+        {
+            continue;
+        }
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => dbs.push(path),
+            Ok(_) => {}
+            Err(_) => complete = false,
+        }
+    }
 
     dbs.sort_unstable();
-    dbs
+    (dbs, complete)
 }
 
 /// Collapse a stream of discovered database paths into a sorted, duplicate-free
@@ -1321,6 +1350,7 @@ fn dedup_dbs_by_canonical_path(paths: impl IntoIterator<Item = PathBuf>) -> Vec<
 /// MiMo Code can be reached from more than one root (the XDG data dir and
 /// orca's hook sandbox), so this unions `discover_micode_dbs` over each
 /// directory and collapses duplicates via `dedup_dbs_by_canonical_path`.
+#[cfg(test)]
 pub(crate) fn discover_micode_dbs_in_dirs(dirs: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     dedup_dbs_by_canonical_path(dirs.into_iter().flat_map(|dir| discover_micode_dbs(&dir)))
 }
@@ -2012,6 +2042,9 @@ fn scan_all_clients_with_env_strategy_inner(
     }
 
     for (client_id, path) in extra_scan_paths_for(scanner_settings, &enabled_with_lookups) {
+        if std::fs::metadata(&path).is_err() {
+            result.source_read_failures.insert(client_id);
+        }
         warn_if_escapes_home(Path::new(home_dir), client_id, &path);
         if client_id == ClientId::DevinCli {
             devin_cli_roots.push(path);
@@ -2132,6 +2165,9 @@ fn scan_all_clients_with_env_strategy_inner(
     if use_env_roots {
         let extra_dirs_val = std::env::var("TOKSCALE_EXTRA_DIRS").unwrap_or_default();
         for (client_id, path) in parse_extra_dirs(&extra_dirs_val, &enabled_with_lookups) {
+            if std::fs::metadata(&path).is_err() {
+                result.source_read_failures.insert(client_id);
+            }
             warn_if_escapes_home(Path::new(home_dir), client_id, &PathBuf::from(&path));
             if client_id == ClientId::DevinCli {
                 devin_cli_roots.push(PathBuf::from(path));
@@ -2221,7 +2257,14 @@ fn scan_all_clients_with_env_strategy_inner(
             "{}/Library/Application Support/orca/mimocode-hooks/shared/data",
             home_dir
         ));
-        result.micode_dbs = discover_micode_dbs_in_dirs([micode_data_dir, orca_data_dir]);
+        for dir in [micode_data_dir, orca_data_dir] {
+            let (dbs, complete) = discover_micode_dbs_with_health(&dir);
+            result.micode_dbs.extend(dbs);
+            if !complete {
+                result.source_read_failures.insert(ClientId::MiMoCode);
+            }
+        }
+        result.micode_dbs = dedup_dbs_by_canonical_path(result.micode_dbs);
     }
 
     if enabled.contains(&ClientId::Kimi) {
@@ -2855,24 +2898,25 @@ fn scan_all_clients_with_env_strategy_inner(
         tasks
             .into_par_iter()
             .map(|(client_id, path, pattern)| {
-                let files = scan_directory(&path, pattern);
-                (client_id, path, files)
+                let (files, complete) = scan_directory_with_health(&path, pattern);
+                (client_id, path, files, complete)
             })
             .collect()
     };
     let scan_workers = std::thread::available_parallelism()
         .map_or(2, |cores| cores.get().min(SCAN_WORKER_CEILING));
-    let scan_results: Vec<(ClientId, String, Vec<PathBuf>)> = match rayon::ThreadPoolBuilder::new()
-        .num_threads(scan_workers)
-        .thread_name(|i| format!("tokscale-scan-{i}"))
-        .build()
-    {
-        Ok(pool) => pool.install(|| scan(tasks)),
-        // A pool that will not build is not worth failing the scan over. The
-        // global pool still produces correct results, just with the contention
-        // this cap exists to avoid.
-        Err(_) => scan(tasks),
-    };
+    let scan_results: Vec<(ClientId, String, Vec<PathBuf>, bool)> =
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(scan_workers)
+            .thread_name(|i| format!("tokscale-scan-{i}"))
+            .build()
+        {
+            Ok(pool) => pool.install(|| scan(tasks)),
+            // A pool that will not build is not worth failing the scan over. The
+            // global pool still produces correct results, just with the contention
+            // this cap exists to avoid.
+            Err(_) => scan(tasks),
+        };
 
     // Aggregate results, deduplicating canonical file paths across overlapping
     // roots while preserving one copy per client. Cherry Studio's V1 and V2
@@ -2880,7 +2924,10 @@ fn scan_all_clients_with_env_strategy_inner(
     // its path selection until V2 can win over a V1 counterpart.
     let mut seen: HashSet<(ClientId, PathBuf)> = HashSet::new();
     let mut cherry_files: Vec<(bool, String, PathBuf)> = Vec::new();
-    for (client_id, root, files) in scan_results {
+    for (client_id, root, files, complete) in scan_results {
+        if !complete {
+            result.source_read_failures.insert(client_id);
+        }
         for file in files {
             if client_id == ClientId::CherryStudio {
                 let is_v2 = is_cherrystudio_v2_root(Path::new(&root));

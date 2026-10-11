@@ -1,0 +1,14 @@
+{
+  "id": "shared-response",
+  "role": "assistant",
+  "modelID": "fixture-model",
+  "providerID": "mimo",
+  "cost": 0.15,
+  "tokens": {
+    "input": -30,
+    "output": 15,
+    "reasoning": 0,
+    "cache": { "read": 0, "write": 0 }
+  },
+  "time": { "created": 1772474400000 }
+}

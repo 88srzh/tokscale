@@ -4998,85 +4998,13 @@ struct TsGraphExport {
     #[serde(flatten)]
     graph: TsTokenContributionData,
     #[serde(skip_serializing_if = "Option::is_none")]
-    source_usage: Option<TsSourceUsage>,
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TsSourceUsage {
-    version: u32,
-    event_identity_version: u32,
-    captured_at: String,
-    full_history: bool,
-    replacement_clients: Vec<String>,
-    partial_clients: Vec<String>,
-    bucket_timezone: String,
-    day_key: String,
-    sessions: Vec<TsSourceSessionUsage>,
-    rows_without_identity: std::collections::BTreeMap<String, u64>,
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TsSourceSessionUsage {
-    client: String,
-    session_id: String,
-    days: Vec<TsDailyContribution>,
-    events: Vec<TsSourceEventUsage>,
-}
-
-#[derive(serde::Serialize)]
-struct TsSourceEventUsage {
-    id: Option<String>,
-    days: Vec<TsDailyContribution>,
+    source_usage: Option<tokscale_core::SourceUsage>,
 }
 
 fn to_ts_graph_export(graph: &tokscale_core::GraphResult) -> TsGraphExport {
     TsGraphExport {
         graph: to_ts_token_contribution_data(graph, None, None),
-        source_usage: graph.source_usage.as_ref().map(|source| TsSourceUsage {
-            version: source.version,
-            event_identity_version: source.event_identity_version,
-            captured_at: source.captured_at.clone(),
-            full_history: source.full_history,
-            replacement_clients: source.replacement_clients.clone(),
-            partial_clients: source.partial_clients.clone(),
-            bucket_timezone: source.bucket_timezone.clone(),
-            day_key: source.day_key.clone(),
-            rows_without_identity: source.rows_without_identity.clone(),
-            sessions: source
-                .sessions
-                .iter()
-                .map(|session| TsSourceSessionUsage {
-                    client: session.client.clone(),
-                    session_id: session.session_id.clone(),
-                    events: session
-                        .events
-                        .iter()
-                        .map(|event| TsSourceEventUsage {
-                            id: event.id.clone(),
-                            days: event
-                                .days
-                                .iter()
-                                .map(|day| {
-                                    to_ts_daily_contribution(
-                                        day,
-                                        &std::collections::BTreeSet::new(),
-                                    )
-                                })
-                                .collect(),
-                        })
-                        .collect(),
-                    days: session
-                        .days
-                        .iter()
-                        .map(|day| {
-                            to_ts_daily_contribution(day, &std::collections::BTreeSet::new())
-                        })
-                        .collect(),
-                })
-                .collect(),
-        }),
+        source_usage: graph.source_usage.clone(),
     }
 }
 
@@ -7881,43 +7809,45 @@ mod tests {
         let normal = serde_json::to_value(to_ts_graph_export(&graph)).unwrap();
         assert!(normal.get("sourceUsage").is_none());
         graph.source_usage = Some(tokscale_core::SourceUsage {
-            version: 1,
-            event_identity_version: 1,
+            version: 2,
+            event_identity_version: 2,
             captured_at: "2026-03-02T00:00:00Z".into(),
             full_history: true,
-            replacement_clients: vec!["opencode".into()],
+            replacement_clients: vec!["micode".into(), "micode-desktop".into()],
             partial_clients: Vec::new(),
             bucket_timezone: "Etc/UTC".into(),
             day_key: "2026-03-02".into(),
+            scopes: Vec::new(),
+            rows_without_identity: Default::default(),
             sessions: vec![tokscale_core::SourceSessionUsage {
-                client: "opencode".into(),
+                client: "micode".into(),
                 session_id: "session".into(),
-                days: graph.contributions.clone(),
+                scope_id: "sha256:scope".into(),
                 events: vec![tokscale_core::SourceEventUsage {
-                    id: Some("sha256:fixture".into()),
-                    days: graph.contributions.clone(),
+                    id: Some("sha256:event".into()),
+                    contributions: vec![tokscale_core::SourceContribution {
+                        timestamp: 1772409600000,
+                        model_id: "model".into(),
+                        provider_id: "provider".into(),
+                        tokens: Default::default(),
+                        cost: 0.5,
+                        messages: 1,
+                    }],
                 }],
             }],
-            rows_without_identity: Default::default(),
         });
         let export = serde_json::to_value(to_ts_graph_export(&graph)).unwrap();
-        assert_eq!(
-            export["sourceUsage"]["sessions"][0]["days"][0],
-            export["contributions"][0]
-        );
-        assert_eq!(export["sourceUsage"]["eventIdentityVersion"], 1);
-        assert_eq!(
-            export["sourceUsage"]["replacementClients"],
-            serde_json::json!(["opencode"])
-        );
-        assert_eq!(
-            export["sourceUsage"]["sessions"][0]["events"][0]["days"][0],
-            export["contributions"][0]
-        );
-        assert_eq!(
-            export["sourceUsage"]["sessions"][0]["days"][0]["clients"][0]["modelId"],
-            ""
-        );
+        assert_eq!(export["sourceUsage"]["eventIdentityVersion"], 2);
+        assert!(export["sourceUsage"]["sessions"][0].get("days").is_none());
+        let event = &export["sourceUsage"]["sessions"][0]["events"][0];
+        assert!(event.get("days").is_none());
+        assert_eq!(event["contributions"][0]["timestamp"], 1772409600000i64);
+        assert!(event["contributions"][0]["tokens"]
+            .get("cacheRead")
+            .is_some());
+        assert!(event["contributions"][0]["tokens"]
+            .get("cache_read")
+            .is_none());
         let submission =
             serde_json::to_value(to_ts_token_contribution_data(&graph, None, None)).unwrap();
         assert!(submission.get("sourceUsage").is_none());

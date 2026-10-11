@@ -39,6 +39,7 @@ use super::{
 pub(crate) const OPENCODE_SCHEMA_PARSER_BASE_VERSION: u32 = 1;
 use crate::{provider_identity, TokenBreakdown};
 use serde::{Deserialize, Serialize};
+use simd_json::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -588,14 +589,12 @@ const MICODE_QUERIES: &[&str] = &[
         FROM message m
         LEFT JOIN session s ON s.id = m.session_id
         WHERE json_extract(m.data, '$.role') = 'assistant'
-          AND json_extract(m.data, '$.tokens') IS NOT NULL
         ORDER BY m.id, m.session_id
     "#,
     r#"
         SELECT m.id, m.session_id, m.data, NULL AS workspace_root, NULL AS session_title, 1 AS eligible
         FROM message m
         WHERE json_extract(m.data, '$.role') = 'assistant'
-          AND json_extract(m.data, '$.tokens') IS NOT NULL
         ORDER BY m.id, m.session_id
     "#,
 ];
@@ -723,6 +722,155 @@ pub(crate) fn reported_cost(cost: Option<f64>) -> Option<f64> {
     cost.filter(|cost| cost.is_finite() && *cost >= 0.0)
 }
 
+/// Source authority cannot inherit the native decoder's clamps or ignored
+/// accounting layouts. Inspect the same JSON tape before typed decoding so
+/// every row still has only one JSON parse and native output stays tolerant.
+fn micode_source_accounting_is_valid(value: simd_json::tape::Value<'_, '_>) -> bool {
+    let Some(message) = value.as_object() else {
+        return false;
+    };
+    if !message
+        .get("role")
+        .is_some_and(|role| role.as_str() == Some("assistant"))
+    {
+        return true;
+    }
+    let Some(tokens) = message.get("tokens").and_then(|tokens| tokens.as_object()) else {
+        return false;
+    };
+    let counter =
+        |value: simd_json::tape::Value<'_, '_>| value.as_i64().filter(|number| *number >= 0);
+    let mut accounted = 0i64;
+    for key in ["input", "output", "reasoning"] {
+        match tokens.get(key) {
+            Some(value) if key == "reasoning" && value.is_null() => {}
+            Some(value) => {
+                let Some(number) = counter(value) else {
+                    return false;
+                };
+                accounted = accounted.saturating_add(number);
+            }
+            None if key == "reasoning" => {}
+            None => return false,
+        }
+    }
+    if let Some(cache) = tokens.get("cache").filter(|value| !value.is_null()) {
+        let Some(cache) = cache.as_object() else {
+            return false;
+        };
+        for key in ["read", "write"] {
+            if let Some(value) = cache.get(key).filter(|value| !value.is_null()) {
+                let Some(number) = counter(value) else {
+                    return false;
+                };
+                accounted = accounted.saturating_add(number);
+            }
+        }
+        for key in [
+            "read_tokens",
+            "write_tokens",
+            "cache_read",
+            "cache_write",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ] {
+            if cache
+                .get(key)
+                .is_some_and(|value| !value.is_null() && counter(value) != Some(0))
+            {
+                return false;
+            }
+        }
+    }
+    // Known alternate counters are not consumed by this parser. Zero/null
+    // declarations carry no discarded usage; positive or malformed ones do.
+    for key in [
+        "input_tokens",
+        "output_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "reasoning_output_tokens",
+        "cached_tokens",
+        "cached_input_tokens",
+        "cache_read",
+        "cache_write",
+        "cacheRead",
+        "cacheWrite",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ] {
+        if tokens
+            .get(key)
+            .is_some_and(|value| !value.is_null() && counter(value) != Some(0))
+        {
+            return false;
+        }
+    }
+    for key in ["total", "total_tokens"] {
+        if tokens.get(key).is_some_and(|value| {
+            !value.is_null() && !counter(value).is_some_and(|total| total <= accounted)
+        }) {
+            return false;
+        }
+    }
+    if message.get("cost").is_some_and(|value| {
+        !value.is_null()
+            && !value
+                .cast_f64()
+                .is_some_and(|cost| cost.is_finite() && cost >= 0.0)
+    }) {
+        return false;
+    }
+    if let Some(usage) = message.get("usage").filter(|value| !value.is_null()) {
+        let Some(usage) = usage.as_object() else {
+            return false;
+        };
+        // Known usage fields in a separate object are not accounted by this
+        // parser. Ignore unrelated metadata, but never discard declared usage.
+        for key in [
+            "input",
+            "output",
+            "reasoning",
+            "input_tokens",
+            "output_tokens",
+            "prompt_tokens",
+            "completion_tokens",
+            "reasoning_tokens",
+            "reasoning_output_tokens",
+            "cached_tokens",
+            "cached_input_tokens",
+            "cache_read",
+            "cache_write",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "total",
+            "total_tokens",
+        ] {
+            if usage
+                .get(key)
+                .is_some_and(|value| !value.is_null() && counter(value) != Some(0))
+            {
+                return false;
+            }
+        }
+        if let Some(cache) = usage.get("cache").filter(|value| !value.is_null()) {
+            let Some(cache) = cache.as_object() else {
+                return false;
+            };
+            for key in ["read", "write", "read_tokens", "write_tokens"] {
+                if cache
+                    .get(key)
+                    .is_some_and(|value| !value.is_null() && counter(value) != Some(0))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 // =============================================================================
 // Deduplication
 // =============================================================================
@@ -796,6 +944,7 @@ struct SchemaAccumulator {
     /// reproduce the collapse. Only collected for a client with an incremental
     /// lane, which is the only thing that reads it.
     merged_dedup_keys: std::collections::HashSet<String>,
+    invalid_rows: bool,
 }
 
 impl SchemaAccumulator {
@@ -830,9 +979,20 @@ impl SchemaAccumulator {
             super::micode::io_tests::record_decode();
         }
         let mut bytes = data_json.into_bytes();
-        let msg: OpenCodeSchemaMessage = match simd_json::from_slice(&mut bytes) {
+        let decoded = if cfg.client == super::micode::MICODE_CLIENT_ID {
+            simd_json::to_tape(&mut bytes).and_then(|tape| {
+                self.invalid_rows |= !micode_source_accounting_is_valid(tape.as_value());
+                tape.deserialize()
+            })
+        } else {
+            simd_json::from_slice(&mut bytes)
+        };
+        let msg: OpenCodeSchemaMessage = match decoded {
             Ok(m) => m,
-            Err(_) => return None,
+            Err(_) => {
+                self.invalid_rows = true;
+                return None;
+            }
         };
 
         // v1 rows carry an explicit role; v2 rows omit it and are pre-filtered
@@ -847,7 +1007,10 @@ impl SchemaAccumulator {
             return None;
         }
 
-        let tokens = msg.tokens.as_ref()?;
+        let Some(tokens) = msg.tokens.as_ref() else {
+            self.invalid_rows = true;
+            return None;
+        };
         let (cache_read, cache_write) = resolve_cache(tokens.cache.as_ref(), cfg.strict_cache)?;
 
         let resolved_model_id = if cfg.dual_schema {
@@ -855,7 +1018,10 @@ impl SchemaAccumulator {
         } else {
             msg.model_id.clone()
         };
-        let model_id = resolved_model_id?;
+        let Some(model_id) = resolved_model_id else {
+            self.invalid_rows = true;
+            return None;
+        };
 
         let provider_id = resolve_provider(&msg, &model_id, cfg);
 
@@ -867,7 +1033,13 @@ impl SchemaAccumulator {
                 time.completed
                     .map(|completed| normalize_epoch(completed, cfg)),
             ),
-            None => (cfg.fallback_timestamp? as f64, None),
+            None => {
+                let Some(timestamp) = cfg.fallback_timestamp else {
+                    self.invalid_rows = true;
+                    return None;
+                };
+                (timestamp as f64, None)
+            }
         };
 
         let agent_or_mode = if cfg.prefer_mode_over_agent {
@@ -1275,11 +1447,13 @@ pub(crate) fn parse_opencode_schema_rows_on(
     };
     let mut complete = true;
     for group in cfg.query_groups {
+        let mut prepared = false;
         for query in *group {
             let scan = collect_rows(db_path, conn, query, &mut |row| {
                 acc.ingest(row, &cfg, &namespace, Some(session_clients));
             });
             if scan.prepared() {
+                prepared = true;
                 #[cfg(test)]
                 if cfg.client == super::micode::MICODE_CLIENT_ID {
                     super::micode::io_tests::record_scan();
@@ -1288,8 +1462,13 @@ pub(crate) fn parse_opencode_schema_rows_on(
                 break;
             }
         }
+        complete &= prepared;
     }
-    (acc.messages, acc.raw_metadata.unwrap_or_default(), complete)
+    (
+        acc.messages,
+        acc.raw_metadata.unwrap_or_default(),
+        complete && !acc.invalid_rows,
+    )
 }
 
 // =============================================================================

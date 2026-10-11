@@ -1,0 +1,1 @@
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":"not-a-number"},"last_token_usage":{"input_tokens":"not-a-number"}}}}
