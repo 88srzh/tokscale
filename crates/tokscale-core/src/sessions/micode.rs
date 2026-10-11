@@ -146,6 +146,7 @@ pub(crate) struct MiMoSource {
     pub messages: Vec<UnifiedMessage>,
     pub metadata: Vec<MiMoRowMetadata>,
     pub complete: bool,
+    pub observed_sessions: Vec<(String, String)>,
 }
 
 #[cfg(test)]
@@ -236,6 +237,7 @@ pub(crate) struct MiMoMessages {
     redirects: Vec<usize>,
     keys: HashMap<String, usize>,
     fingerprints: HashMap<UsageFingerprint, Vec<usize>>,
+    identity_unresolved: bool,
 }
 
 impl MiMoMessages {
@@ -307,6 +309,7 @@ impl MiMoMessages {
         });
         let candidate = match (by_key, by_fingerprint) {
             (Some(key), Some(fingerprint)) if key != fingerprint => {
+                self.identity_unresolved = true;
                 // An id-only copy without chronology can arrive before the
                 // row proving that id belongs to another slot's fork history.
                 // Join both identities rather than allowing the early key hit
@@ -354,6 +357,9 @@ impl MiMoMessages {
             (key, fingerprint) => key.or(fingerprint),
         };
         if let Some(index) = candidate {
+            // Different native IDs can be merged by fingerprint/chronology.
+            // This scan cannot prove the same alias set will survive a rescan.
+            self.identity_unresolved |= self.messages[index].dedup_key != message.dedup_key;
             if let Some(key) = &message.dedup_key {
                 self.keys.insert(key.clone(), index);
             }
@@ -433,7 +439,15 @@ impl MiMoMessages {
         }
     }
 
-    pub(crate) fn into_messages(mut self) -> Vec<UnifiedMessage> {
+    pub(crate) fn into_messages(self) -> Vec<UnifiedMessage> {
+        self.into_messages_with_identity().0
+    }
+
+    pub(crate) fn into_messages_with_identity(mut self) -> (Vec<UnifiedMessage>, bool) {
+        self.identity_unresolved |= self
+            .pending
+            .iter()
+            .any(|(_, origin)| !origin.has_embedded_id);
         let mut pending = std::mem::take(&mut self.pending);
         // Establish original owners before matching their historical copies.
         // This also handles several copies arriving before the only original.
@@ -446,11 +460,14 @@ impl MiMoMessages {
         for (message, origin) in pending {
             self.insert(message, origin);
         }
-        self.messages
+        let exact = !self.identity_unresolved;
+        let messages = self
+            .messages
             .into_iter()
             .enumerate()
             .filter_map(|(index, message)| (self.redirects[index] == index).then_some(message))
-            .collect()
+            .collect();
+        (messages, exact)
     }
 }
 
@@ -495,6 +512,27 @@ pub(crate) fn parse_micode_source(db_path: &Path) -> MiMoSource {
         OpenCodeSchemaConfig::micode(),
         &session_clients,
     );
+    let mut observed_sessions: Vec<_> = sessions
+        .iter()
+        .map(|(id, info)| {
+            (
+                if info.desktop {
+                    MICODE_DESKTOP_CLIENT_ID
+                } else {
+                    MICODE_CLIENT_ID
+                }
+                .to_string(),
+                id.clone(),
+            )
+        })
+        .collect();
+    observed_sessions.extend(
+        messages
+            .iter()
+            .map(|message| (message.client.clone(), message.session_id.clone())),
+    );
+    observed_sessions.sort();
+    observed_sessions.dedup();
     let metadata = messages
         .iter()
         .zip(rows)
@@ -513,6 +551,7 @@ pub(crate) fn parse_micode_source(db_path: &Path) -> MiMoSource {
         messages,
         metadata,
         complete: complete && sessions_complete,
+        observed_sessions,
     }
 }
 
@@ -771,6 +810,142 @@ mod tests {
         assert_eq!(messages[0].tokens.cache_write, 0);
         assert_eq!(messages[0].tokens.reasoning, 0);
         assert!(messages[0].cost >= 0.0);
+    }
+
+    #[test]
+    fn test_micode_source_invalid_declared_accounting_preserves_native_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mimocode.db");
+        let conn = create_micode_sqlite_db(&db_path);
+        let valid = serde_json::json!({"id":"response","role":"assistant","modelID":"mimo-test","cost":0.15,"tokens":{"input":0,"output":15},"time":{"created":1772474400000i64}});
+        conn.execute(
+            "INSERT INTO message VALUES ('row','session',?1)",
+            [valid.to_string()],
+        )
+        .unwrap();
+        for (pointer, value, expected_rows, expected_tokens) in [
+            ("/tokens/input", serde_json::json!(-30), 1, 15),
+            ("/tokens/output", serde_json::json!(-15), 1, 0),
+            ("/tokens/reasoning", serde_json::json!(-1), 1, 15),
+            ("/tokens/input", serde_json::json!("bad"), 0, 0),
+            ("/tokens/input", serde_json::json!(true), 0, 0),
+            ("/tokens/output", serde_json::json!(1.5), 0, 0),
+            ("/tokens/reasoning", serde_json::json!("bad"), 0, 0),
+            ("/tokens/input", serde_json::json!(u64::MAX), 0, 0),
+            ("/tokens/input", serde_json::Value::Null, 0, 0),
+            (
+                "/tokens/cache",
+                serde_json::json!({"read":-1,"write":0}),
+                1,
+                15,
+            ),
+            (
+                "/tokens/cache",
+                serde_json::json!({"read":0,"write":-1}),
+                1,
+                15,
+            ),
+            ("/tokens/cache", serde_json::json!({"read":"bad"}), 0, 0),
+            ("/tokens/cache", serde_json::json!([]), 1, 15),
+            ("/tokens", serde_json::json!([0, 15, null, null]), 1, 15),
+            (
+                "/tokens/cache",
+                serde_json::json!({"read_tokens":45}),
+                1,
+                15,
+            ),
+            ("/tokens/prompt_tokens", serde_json::json!(45), 1, 15),
+            ("/tokens/total", serde_json::json!(45), 1, 15),
+            ("/usage", serde_json::json!({"input_tokens":45}), 1, 15),
+            ("/usage", serde_json::json!({"cache":{"read":45}}), 1, 15),
+            ("/usage", serde_json::json!("bad"), 1, 15),
+            ("/cost", serde_json::json!(-0.15), 1, 15),
+            ("/cost", serde_json::json!("bad"), 0, 0),
+            ("/cost", serde_json::json!({"amount":0.15}), 0, 0),
+        ] {
+            let mut data = valid.clone();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            data.pointer_mut(parent)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(key.into(), value);
+            conn.execute("UPDATE message SET data=?1", [data.to_string()])
+                .unwrap();
+            let source = parse_micode_source(&db_path);
+            assert!(!source.complete, "{pointer}: {data}");
+            assert_eq!(source.messages.len(), expected_rows, "{data}");
+            assert_eq!(source.messages.len(), source.metadata.len());
+            assert_eq!(
+                source
+                    .messages
+                    .iter()
+                    .map(|m| m.tokens.total())
+                    .sum::<i64>(),
+                expected_tokens,
+                "{data}"
+            );
+            assert_eq!(
+                serde_json::to_value(&source.messages).unwrap(),
+                serde_json::to_value(parse_micode_sqlite(&db_path)).unwrap(),
+                "native parsing must remain tolerant: {data}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_micode_source_optional_null_and_non_usage_metadata_are_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("mimocode.db");
+        let conn = create_micode_sqlite_db(&db_path);
+        conn.execute_batch("CREATE TABLE session(id TEXT PRIMARY KEY, version TEXT, time_created REAL, directory TEXT); INSERT INTO session VALUES ('session','1.0',1772474400000,'/fixture');").unwrap();
+        for optional in [
+            serde_json::json!({}),
+            serde_json::json!({"reasoning":null,"cache":null}),
+            serde_json::json!({"cache":{}}),
+            serde_json::json!({"cache":{"read":null,"write":null}}),
+            serde_json::json!({"reasoning":0,"cache":{"read":0,"write":0},"total":0}),
+            serde_json::json!({"input_tokens":null,"cache":{"read_tokens":0,"future":"metadata"}}),
+        ] {
+            let mut tokens = serde_json::json!({"input":0,"output":0});
+            tokens
+                .as_object_mut()
+                .unwrap()
+                .extend(optional.as_object().unwrap().clone());
+            let data = serde_json::json!({"id":"response","role":"assistant","modelID":"mimo-test","cost":null,"tokens":tokens,"usage":null,"path":false,"future_metadata":{"input_tokens":"not accounting"},"time":{"created":1772474400000i64,"completed":null}});
+            conn.execute(
+                "INSERT OR REPLACE INTO message VALUES ('row','session',?1)",
+                [data.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO message VALUES ('metadata','session',?1)",
+                [r#"{"role":"user","tokens":"not usage","cost":"metadata"}"#],
+            )
+            .unwrap();
+            let source = parse_micode_source(&db_path);
+            assert!(source.complete, "{data}");
+            assert_eq!(source.messages.len(), 1);
+            assert_eq!(source.messages[0].tokens.total(), 0);
+            assert_eq!(
+                source.observed_sessions,
+                vec![("micode".into(), "session".into())]
+            );
+        }
+        conn.execute("UPDATE message SET data=json_set(data,'$.cost',0,'$.usage',json('{\"input_tokens\":0,\"service_tier\":\"standard\",\"future\":{\"info\":\"metadata\"}}')) WHERE id='row'", []).unwrap();
+        assert!(
+            parse_micode_source(&db_path).complete,
+            "integer zero cost and non-usage metadata"
+        );
+        conn.execute("DELETE FROM message WHERE id='row'", [])
+            .unwrap();
+        let empty = parse_micode_source(&db_path);
+        assert!(empty.complete);
+        assert!(empty.messages.is_empty());
+        assert_eq!(
+            empty.observed_sessions,
+            vec![("micode".into(), "session".into())]
+        );
     }
 
     #[test]

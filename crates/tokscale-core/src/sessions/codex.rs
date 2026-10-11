@@ -462,6 +462,8 @@ pub(crate) struct ParsedCodexFile {
     pub fallback_timestamp_indices: Vec<usize>,
     pub consumed_offset: u64,
     pub parse_succeeded: bool,
+    /// Opt-in full-read authority; native tolerance/cache success is weaker.
+    pub source_read_succeeded: bool,
     /// True when model-less token_count rows were emitted without a later model.
     pub unresolved_model_events: bool,
     pub state: CodexParseState,
@@ -525,12 +527,207 @@ fn looks_like_explicit_workspace_path(path: &str) -> bool {
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
 }
 
+/// Validate accounting records separately from the tolerant native decoder.
+/// Unknown non-usage records may contain future schemas; they are not errors.
+fn codex_source_usage_is_valid(value: &Value, typed_decode_succeeded: bool) -> bool {
+    let entry_type = value.get("type").and_then(Value::as_str);
+    let payload = value.get("payload");
+    let payload_type = payload.and_then(|p| p.get("type")).and_then(Value::as_str);
+    let is_token_count = entry_type == Some("event_msg") && payload_type == Some("token_count");
+    if !is_token_count
+        && payload.and_then(|p| p.get("info")).is_some_and(|info| {
+            ["last_token_usage", "total_token_usage"]
+                .iter()
+                .any(|key| info.get(*key).is_some_and(|v| !v.is_null()))
+        })
+    {
+        return false;
+    }
+    let requires_typed_decode = matches!(
+        entry_type,
+        Some("session_meta" | "turn_context" | "token_usage_record")
+    ) || (entry_type == Some("event_msg")
+        && matches!(
+            payload_type,
+            Some("token_count" | "task_started" | "thread_settings_applied")
+        ))
+        || payload.is_some_and(|p| {
+            p.get("role").and_then(Value::as_str) == Some("assistant") && p.get("usage").is_some()
+        });
+    if requires_typed_decode && (!typed_decode_succeeded || !payload.is_some_and(Value::is_object))
+    {
+        return false;
+    }
+    if entry_type == Some("event_msg") && payload_type == Some("task_started") {
+        if let Some(started_at) = payload
+            .and_then(|p| p.get("started_at"))
+            .filter(|v| !v.is_null())
+        {
+            if !started_at.as_i64().is_some_and(|n| n >= 0) {
+                return false;
+            }
+        }
+    }
+    if is_token_count {
+        // Codex legitimately emits info:null for rate-limit-only updates.
+        if let Some(info) = payload.and_then(|p| p.get("info")).filter(|v| !v.is_null()) {
+            for key in ["last_token_usage", "total_token_usage"] {
+                if let Some(usage) = info.get(key).filter(|v| !v.is_null()) {
+                    if !codex_source_usage_numbers_are_valid(usage, false) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(usage) = payload
+        .and_then(|p| p.get("usage"))
+        .filter(|v| !v.is_null())
+    {
+        if !codex_source_usage_numbers_are_valid(usage, false)
+            || (entry_type != Some("token_usage_record") && !source_usage_is_zero(usage))
+        {
+            // Other payload-level usage layouts are not priced by the native
+            // decoder. A typed success must not discard their declared usage.
+            return false;
+        }
+    }
+    // These are the usage locations supported by the native headless decoder.
+    // Check every present location so a valid alias cannot hide a failed one.
+    let mut observed_headless_usage = None;
+    for container in [
+        Some(value),
+        value.get("data"),
+        value.get("result"),
+        value.get("response"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(usage) = container.get("usage") {
+            if !codex_source_usage_numbers_are_valid(usage, true)
+                || observed_headless_usage.is_some_and(|prior| prior != usage)
+                || ((requires_typed_decode
+                    || (entry_type == Some("event_msg") && payload_type == Some("user_message")))
+                    && !source_usage_is_zero(usage))
+            {
+                return false;
+            }
+            observed_headless_usage = Some(usage);
+        }
+    }
+    true
+}
+
+fn source_usage_is_zero(usage: &Value) -> bool {
+    usage.as_object().is_some_and(|fields| {
+        fields
+            .iter()
+            .filter(|(key, _)| key.as_str() != "service_tier")
+            .all(|(_, value)| value.as_i64() == Some(0))
+    })
+}
+
+fn codex_source_usage_numbers_are_valid(usage: &Value, headless: bool) -> bool {
+    let Some(usage) = usage.as_object() else {
+        return false;
+    };
+    let mut observed_counter = false;
+    for key in [
+        "input_tokens",
+        "output_tokens",
+        "cached_input_tokens",
+        "cache_read_input_tokens",
+        "reasoning_output_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "input",
+        "output",
+        "cached_tokens",
+        "total_tokens",
+    ] {
+        if let Some(value) = usage.get(key) {
+            if !value.as_i64().is_some_and(|n| n >= 0) {
+                return false;
+            }
+            let supported = if headless {
+                key != "reasoning_output_tokens"
+            } else {
+                !matches!(
+                    key,
+                    "prompt_tokens" | "completion_tokens" | "input" | "output" | "cached_tokens"
+                )
+            };
+            if !supported && value.as_i64() != Some(0) {
+                return false;
+            }
+            observed_counter |= supported && key != "total_tokens";
+        }
+    }
+    // A headless alias is a fallback for the same counter, not extra usage.
+    let aliases_agree = !headless
+        || [
+            ["input_tokens", "prompt_tokens", "input"],
+            ["output_tokens", "completion_tokens", "output"],
+            [
+                "cached_input_tokens",
+                "cache_read_input_tokens",
+                "cached_tokens",
+            ],
+        ]
+        .iter()
+        .all(|keys| {
+            let mut values = keys.iter().filter_map(|key| usage.get(*key));
+            let first = values.next();
+            values.all(|v| Some(v) == first)
+        });
+    // A declared total cannot be explained by defaulting missing counters to
+    // zero. Compare with the counters the native decoder actually accounts for.
+    let counter = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| usage.get(*key).and_then(Value::as_i64))
+            .unwrap_or(0)
+    };
+    let (input, output, cached, reasoning) = if headless {
+        (
+            counter(&["input_tokens", "prompt_tokens", "input"]),
+            counter(&["output_tokens", "completion_tokens", "output"]),
+            counter(&[
+                "cached_input_tokens",
+                "cache_read_input_tokens",
+                "cached_tokens",
+            ]),
+            0,
+        )
+    } else {
+        (
+            counter(&["input_tokens"]),
+            counter(&["output_tokens"]),
+            counter(&["cached_input_tokens"]).max(counter(&["cache_read_input_tokens"])),
+            counter(&["reasoning_output_tokens"]),
+        )
+    };
+    let accounted = input
+        .saturating_sub(cached)
+        .max(0)
+        .saturating_add(cached)
+        .saturating_add(output)
+        .saturating_add(reasoning);
+    let total_explained = usage
+        .get("total_tokens")
+        .and_then(Value::as_i64)
+        .is_none_or(|total| total <= accounted);
+    // An empty/defaulted object is not proof of zero; explicit numeric zero is.
+    observed_counter && aliases_agree && total_explained
+}
+
 fn parse_codex_reader<R: BufRead>(
     mut reader: R,
     session_id: &str,
     fallback_timestamp: i64,
     start_offset: u64,
     mut state: CodexParseState,
+    source_health: bool,
 ) -> ParsedCodexFile {
     let mut messages = Vec::with_capacity(64);
     let mut fallback_timestamp_indices = Vec::new();
@@ -538,6 +735,7 @@ fn parse_codex_reader<R: BufRead>(
     let mut line = String::with_capacity(4096);
     let mut consumed_offset = start_offset;
     let mut parse_succeeded = true;
+    let mut source_schema_succeeded = source_health;
     let mut pending_model_messages = Vec::new();
     let mut unresolved_model_events = false;
 
@@ -561,7 +759,13 @@ fn parse_codex_reader<R: BufRead>(
         let mut handled = false;
         buffer.clear();
         buffer.extend_from_slice(trimmed.as_bytes());
-        if let Ok(entry) = simd_json::from_slice::<CodexEntry>(&mut buffer) {
+        let entry = simd_json::from_slice::<CodexEntry>(&mut buffer);
+        if source_health {
+            let mut probe = trimmed.as_bytes().to_vec();
+            source_schema_succeeded &= simd_json::from_slice::<Value>(&mut probe)
+                .is_ok_and(|value| codex_source_usage_is_valid(&value, entry.is_ok()));
+        }
+        if let Ok(entry) = entry {
             if let Some(payload) = entry.payload {
                 // Request-level usage records carry actual per-response tier
                 // metadata in newer Codex rollouts. The token_count snapshots
@@ -1056,6 +1260,17 @@ fn parse_codex_reader<R: BufRead>(
                     // The raw parent thread id; reports and the TUI resolve it
                     // to a surviving parent rollout after their own filtering.
                     message.parent_session_id = state.session_parent_thread_id.clone();
+                    message.source_group_key = state
+                        .session_forked_from_id
+                        .as_deref()
+                        .or(state.session_id_from_meta.as_deref())
+                        .zip(state.current_turn_id.as_deref())
+                        .filter(|(session, turn)| {
+                            !session.trim().is_empty() && !turn.trim().is_empty()
+                        })
+                        .map(|(session, turn)| {
+                            crate::source_snapshot::codex_group_key(session, turn)
+                        });
                     state.turn_coverage.record(state.current_turn_id.as_deref());
                     // The announced turn has produced usage, so it is under
                     // way: a `turn_context` without an id that comes later
@@ -1181,6 +1396,7 @@ fn parse_codex_reader<R: BufRead>(
         fallback_timestamp_indices,
         consumed_offset,
         parse_succeeded,
+        source_read_succeeded: parse_succeeded && source_schema_succeeded,
         unresolved_model_events,
         state,
     }
@@ -1492,6 +1708,20 @@ pub(crate) fn parse_codex_file_incremental(
     start_offset: u64,
     state: CodexParseState,
 ) -> ParsedCodexFile {
+    parse_codex_file_with_source_health(path, start_offset, state, false)
+}
+
+/// Source snapshots require a fresh full read, never cached native parse health.
+pub(crate) fn parse_codex_file_for_source(path: &Path) -> ParsedCodexFile {
+    parse_codex_file_with_source_health(path, 0, CodexParseState::default(), true)
+}
+
+fn parse_codex_file_with_source_health(
+    path: &Path,
+    start_offset: u64,
+    state: CodexParseState,
+    source_health: bool,
+) -> ParsedCodexFile {
     let session_id = session_id_from_path(path);
     let fallback_timestamp = file_modified_timestamp_ms(path);
 
@@ -1502,6 +1732,7 @@ pub(crate) fn parse_codex_file_incremental(
                 fallback_timestamp_indices: Vec::new(),
                 consumed_offset: start_offset,
                 parse_succeeded: false,
+                    source_read_succeeded: false,
                 unresolved_model_events: false,
                 state,
             };
@@ -1516,6 +1747,7 @@ pub(crate) fn parse_codex_file_incremental(
                     fallback_timestamp_indices: Vec::new(),
                     consumed_offset: 0,
                     parse_succeeded: false,
+                    source_read_succeeded: false,
                     unresolved_model_events: false,
                     state,
                 };
@@ -1531,6 +1763,7 @@ pub(crate) fn parse_codex_file_incremental(
                     fallback_timestamp_indices: Vec::new(),
                     consumed_offset: 0,
                     parse_succeeded: false,
+                    source_read_succeeded: false,
                     unresolved_model_events: false,
                     state,
                 };
@@ -1543,17 +1776,19 @@ pub(crate) fn parse_codex_file_incremental(
                 fallback_timestamp_indices: Vec::new(),
                 consumed_offset: 0,
                 parse_succeeded: false,
+                    source_read_succeeded: false,
                 unresolved_model_events: false,
                 state,
             };
         }
 
         let reader = BufReader::new(decoder.take(MAX_ARCHIVE_BYTES + 1));
-        let mut parsed = parse_codex_reader(reader, &session_id, fallback_timestamp, 0, state);
+        let mut parsed = parse_codex_reader(reader, &session_id, fallback_timestamp, 0, state, source_health);
         if parsed.consumed_offset > MAX_ARCHIVE_BYTES || !parsed.parse_succeeded {
             parsed.messages.clear();
             parsed.fallback_timestamp_indices.clear();
             parsed.parse_succeeded = false;
+            parsed.source_read_succeeded = false;
         }
         return parsed;
     }
@@ -1566,6 +1801,7 @@ pub(crate) fn parse_codex_file_incremental(
                 fallback_timestamp_indices: Vec::new(),
                 consumed_offset: start_offset,
                 parse_succeeded: false,
+                source_read_succeeded: false,
                 unresolved_model_events: false,
                 state,
             };
@@ -1578,13 +1814,21 @@ pub(crate) fn parse_codex_file_incremental(
             fallback_timestamp_indices: Vec::new(),
             consumed_offset: start_offset,
             parse_succeeded: false,
+            source_read_succeeded: false,
             unresolved_model_events: false,
             state,
         };
     }
 
     let reader = BufReader::new(file);
-    parse_codex_reader(reader, &session_id, fallback_timestamp, start_offset, state)
+    parse_codex_reader(
+        reader,
+        &session_id,
+        fallback_timestamp,
+        start_offset,
+        state,
+        source_health,
+    )
 }
 
 fn extract_model(payload: &CodexPayload) -> Option<String> {
@@ -1845,6 +2089,128 @@ mod tests {
     const CODEX_TASK_STARTED_DURATION_FIXTURE: &str =
         include_str!("../../tests/fixtures/codex_task_started_duration.jsonl");
 
+    const SOURCE_HEALTH_PREFIX: &str = concat!(
+        r#"{"type":"session_meta","payload":{"id":"upstream","model_provider":"openai"}}"#,
+        "\n",
+        r#"{"type":"turn_context","payload":{"turn_id":"stable-turn","model":"gpt-5.4"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-03-02T18:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15},"last_token_usage":{"input_tokens":15}}}}"#,
+        "\n",
+    );
+
+    #[test]
+    fn codex_source_health_rejects_schema_invalid_usage_without_changing_native_rows() {
+        let invalid_records = [
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":"not-a-number"},"last_token_usage":{"input_tokens":"not-a-number"}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":[]}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":null}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":-1}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1.5}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":18446744073709551615}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"prompt_tokens":45}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0,"prompt_tokens":45}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":45}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0,"total_tokens":45}}}}"#,
+            r#"{"type":"event_msg","payload":{"info":{"last_token_usage":{"input_tokens":45}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_started","started_at":"not-a-number"}}"#,
+            r#"{"type":"turn_context"}"#,
+            r#"{"type":"token_usage_record","payload":{"usage":{"input_tokens":"not-a-number"}}}"#,
+            r#"{"type":"assistant","usage":{"input_tokens":"not-a-number"}}"#,
+            r#"{"type":"assistant","usage":{"input_tokens":0,"prompt_tokens":45}}"#,
+            r#"{"type":"assistant","usage":{"input_tokens":0,"reasoning_output_tokens":45}}"#,
+            r#"{"type":"assistant","usage":{"input_tokens":0,"total_tokens":45}}"#,
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"text"},"usage":{"input_tokens":45}}"#,
+            r#"{"type":"assistant","usage":{"input_tokens":0},"response":{"usage":{"input_tokens":45}}}"#,
+            r#"{"type":"result","data":{"usage":{}}}"#,
+            r#"{"type":"result","result":{"usage":{"input_tokens":"not-a-number"}}}"#,
+            r#"{"type":"result","response":{"usage":{"input_tokens":"not-a-number"}}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","usage":{"input_tokens":"not-a-number"}}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","usage":{"input_tokens":45}}}"#,
+            r#"{"type":"turn_context","payload":{"turn_id":"next-turn","model":42}}"#,
+        ];
+        for invalid in invalid_records {
+            let file = create_test_file(&format!("{SOURCE_HEALTH_PREFIX}{invalid}\n"));
+            let native = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+            let source = parse_codex_file_for_source(file.path());
+            assert!(native.parse_succeeded, "{invalid}");
+            assert!(!native.source_read_succeeded);
+            assert!(source.parse_succeeded, "{invalid}");
+            assert!(!source.source_read_succeeded, "{invalid}");
+            assert_eq!(native.messages.len(), 1, "{invalid}");
+            assert_eq!(native.messages[0].tokens.input, 15, "{invalid}");
+            assert_eq!(
+                serde_json::to_value(&source.messages).unwrap(),
+                serde_json::to_value(&native.messages).unwrap(),
+                "{invalid}"
+            );
+            assert_eq!(
+                source.messages[0].source_group_key,
+                native.messages[0].source_group_key
+            );
+        }
+    }
+
+    #[test]
+    fn codex_source_health_accepts_explicit_zero_and_unknown_non_usage_records() {
+        for record in [
+            r#"{"type":"future_non_usage","payload":{"info":"unknown-schema"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"future_non_usage","info":"unknown-schema"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0,"output_tokens":0}}}}"#,
+            r#"{"type":"assistant","usage":{"input_tokens":0,"output_tokens":0}}"#,
+            r#"{"type":"assistant","usage":{"input":0,"output":0}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_started","started_at":null}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","rate_limits":{}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":null,"total_token_usage":null}}}"#,
+            r#"{"type":"token_usage_record","payload":{"service_tier":"priority","usage":null}}"#,
+            r#"{"type":"token_usage_record","payload":{"service_tier":"priority"}}"#,
+        ] {
+            let file = create_test_file(&format!("{SOURCE_HEALTH_PREFIX}{record}\n"));
+            let source = parse_codex_file_for_source(file.path());
+            assert!(source.source_read_succeeded, "{record}");
+            assert_eq!(source.messages.len(), 1, "{record}");
+            assert_eq!(source.messages[0].tokens.input, 15, "{record}");
+        }
+    }
+
+    #[test]
+    fn codex_source_health_accepts_supported_optional_usage_shapes() {
+        for record in [
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"output_tokens":5},"total_token_usage":null}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":null,"total_token_usage":{"input_tokens":20}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":5,"future_metadata":"supported-counter-present"}}}}"#,
+            r#"{"type":"token_usage_record","payload":{"usage":{"input_tokens":15,"service_tier":"priority"}}}"#,
+            r#"{"type":"assistant","usage":{"prompt_tokens":2,"completion_tokens":3,"cached_tokens":1}}"#,
+            r#"{"usage":{"input_tokens":2,"prompt_tokens":2,"output_tokens":3},"timestamp":1772474400}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":5,"total_tokens":5}}}}"#,
+        ] {
+            let file = create_test_file(&format!("{SOURCE_HEALTH_PREFIX}{record}\n"));
+            let native = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+            let source = parse_codex_file_for_source(file.path());
+            assert!(source.source_read_succeeded, "{record}");
+            assert_eq!(
+                serde_json::to_value(&source.messages).unwrap(),
+                serde_json::to_value(&native.messages).unwrap(),
+                "{record}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_source_health_rejects_io_and_json_failures() {
+        let reader = FailAfterFirstLine::new(SOURCE_HEALTH_PREFIX);
+        let source = parse_codex_reader(reader, "session", 0, 0, CodexParseState::default(), true);
+        assert!(!source.source_read_succeeded);
+        let file = create_test_file(&format!("{SOURCE_HEALTH_PREFIX}{{malformed-json\n"));
+        assert!(!parse_codex_file_for_source(file.path()).source_read_succeeded);
+        assert!(
+            !parse_codex_file_for_source(&file.path().with_extension("missing"))
+                .source_read_succeeded
+        );
+    }
+
     #[test]
     fn codex_human_turn_matches_only_known_system_tags() {
         // Real human prompts that happen to start with markup must still count.
@@ -1916,7 +2282,7 @@ mod tests {
         assert!(!parsed.is_missing_usage());
 
         let reader = FailAfterFirstLine::new(UNMETERED_ACTIVITY);
-        let parsed = parse_codex_reader(reader, "session", 0, 0, CodexParseState::default());
+        let parsed = parse_codex_reader(reader, "session", 0, 0, CodexParseState::default(), false);
         assert!(parsed.state.has_own_activity);
         assert!(!parsed.parse_succeeded);
         assert!(!parsed.is_missing_usage());
@@ -2548,7 +2914,7 @@ mod tests {
             "\n"
         ));
 
-        let parsed = parse_codex_reader(reader, "session", 0, 0, CodexParseState::default());
+        let parsed = parse_codex_reader(reader, "session", 0, 0, CodexParseState::default(), false);
 
         assert!(!parsed.parse_succeeded);
         assert!(parsed.messages.is_empty());

@@ -1,33 +1,52 @@
 use super::*;
-use crate::{bucket_tz::BucketTimezone, SourceUsage};
+use crate::{
+    bucket_tz::BucketTimezone,
+    source_snapshot::{source_event_id, source_scope_id, SourceReadEvidence},
+};
+use crate::{SourceEventUsage, SourceUsage};
 use std::time::Instant;
 
-fn message(client: &str, session: &str, date: &str, model: &str, tokens: i64) -> UnifiedMessage {
+fn message(
+    client: &str,
+    session: &str,
+    date: &str,
+    model: &str,
+    input: i64,
+    key: Option<&str>,
+) -> UnifiedMessage {
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&format!("{date}T12:00:00Z"))
+        .unwrap()
+        .timestamp_millis();
     let mut message = UnifiedMessage::new(
         client,
         model,
         "provider",
         session,
-        0,
+        timestamp,
         TokenBreakdown {
-            input: tokens,
+            input,
             ..Default::default()
         },
-        tokens as f64 / 100.0,
+        input as f64 / 100.0,
     );
     message.date = date.into();
+    message.dedup_key = key.map(str::to_string);
     message
 }
 
-fn snapshot_graph(options: &ReportOptions, messages: Vec<UnifiedMessage>) -> crate::GraphResult {
+fn snapshot(
+    options: &ReportOptions,
+    messages: Vec<UnifiedMessage>,
+    evidence: Option<SourceReadEvidence>,
+) -> crate::GraphResult {
     let mut sink = GraphSink::new(
         Some(options),
         None,
         GraphPricingRequirement::LenientSourceSnapshots,
     );
     sink.enable_source_snapshots(SourceUsage {
-        version: 1,
-        event_identity_version: 1,
+        version: 2,
+        event_identity_version: 2,
         captured_at: "2026-03-03T00:00:00Z".into(),
         full_history: options.since.is_none() && options.until.is_none() && options.year.is_none(),
         replacement_clients: crate::source_replacement_clients(options.clients.as_deref()),
@@ -35,8 +54,12 @@ fn snapshot_graph(options: &ReportOptions, messages: Vec<UnifiedMessage>) -> cra
         bucket_timezone: "Etc/UTC".into(),
         day_key: "2026-03-03".into(),
         sessions: Vec::new(),
+        scopes: Vec::new(),
         rows_without_identity: Default::default(),
     });
+    if let Some(evidence) = evidence {
+        sink.observe_source(evidence);
+    }
     for message in messages {
         sink.accept(message);
     }
@@ -47,543 +70,358 @@ fn snapshot_graph(options: &ReportOptions, messages: Vec<UnifiedMessage>) -> cra
     .unwrap()
 }
 
-#[test]
-fn source_snapshots_fold_every_day_model_and_client_partition() {
-    let graph = snapshot_graph(
-        &ReportOptions::default(),
-        vec![
-            message("opencode", "shared", "2026-03-02", "model-a", 10),
-            message("opencode", "shared", "2026-03-01", "model-a", 20),
-            message("opencode", "shared", "2026-03-01", "model-b", 30),
-            message("codex", "shared", "2026-03-01", "model-a", 40),
-            message("opencode", "other", "2026-03-01", "model-a", 5),
-        ],
-    );
-    let source = graph.source_usage.unwrap();
-    assert_eq!(source.sessions.len(), 3);
-    let session = source
-        .sessions
+fn tokens(event: &SourceEventUsage) -> i64 {
+    event
+        .contributions
         .iter()
-        .find(|s| s.client == "opencode" && s.session_id == "shared")
-        .unwrap();
-    assert_eq!(
-        session
-            .days
-            .iter()
-            .map(|d| d.date.as_str())
-            .collect::<Vec<_>>(),
-        ["2026-03-01", "2026-03-02"]
-    );
-    assert_eq!(session.days[0].totals.tokens, 50);
-    assert_eq!(session.days[0].totals.messages, 2);
-    assert_eq!(session.days[0].clients.len(), 2);
-    assert_eq!(session.days[0].totals.cost, 0.5);
-    assert_eq!(
-        source
-            .sessions
-            .iter()
-            .flat_map(|s| &s.days)
-            .map(|d| d.totals.tokens)
-            .sum::<i64>(),
-        graph.summary.total_tokens
-    );
-    assert_eq!(graph.summary.total_tokens, 105);
+        .map(|c| {
+            c.tokens.input
+                + c.tokens.output
+                + c.tokens.cache_read
+                + c.tokens.cache_write
+                + c.tokens.reasoning
+        })
+        .sum()
 }
-
-#[test]
-fn source_snapshots_corrections_replace_whole_session_days() {
-    let old = snapshot_graph(
-        &ReportOptions::default(),
-        vec![
-            message("opencode", "same", "2026-03-01", "old-model", 100),
-            message("opencode", "same", "2026-03-02", "old-model", 50),
-        ],
-    )
-    .source_usage
-    .unwrap();
-    let corrected = snapshot_graph(
-        &ReportOptions::default(),
-        vec![message("opencode", "same", "2026-03-02", "new-model", 7)],
-    )
-    .source_usage
-    .unwrap();
-    // A downstream map replaces the entire (client, session) snapshot; merging
-    // day/model maxima here would resurrect both the old day and old model.
-    let mut archive: HashMap<_, _> = old
-        .sessions
-        .into_iter()
-        .map(|s| ((s.client.clone(), s.session_id.clone()), s.days))
-        .collect();
-    for session in corrected.sessions {
-        archive.insert((session.client, session.session_id), session.days);
-    }
-    let days = &archive[&("opencode".into(), "same".into())];
-    assert_eq!(days.len(), 1);
-    assert_eq!(days[0].date, "2026-03-02");
-    assert_eq!(days[0].totals.tokens, 7);
-    assert_eq!(days[0].clients[0].model_id, "new-model");
-}
-
-#[test]
-fn source_snapshots_keep_out_of_window_ids_and_zero_usage_but_diagnose_identity_gaps() {
-    let options = ReportOptions {
-        since: Some("2026-03-02".into()),
+fn selected(clients: &[&str]) -> ReportOptions {
+    ReportOptions {
+        clients: Some(clients.iter().map(|s| s.to_string()).collect()),
         ..Default::default()
-    };
-    let graph = snapshot_graph(
-        &options,
-        vec![
-            message("opencode", "outside", "2026-03-01", "model", 9),
-            message("opencode", "zero", "2026-03-02", "", 0),
-            message("opencode", "", "2026-03-02", "model", 3),
-            message("opencode", "unknown", "2026-03-02", "model", 4),
-            message("codex", "  ", "2026-03-01", "model", 5),
-        ],
-    );
-    let source = graph.source_usage.unwrap();
-    assert!(!source.full_history);
-    assert_eq!(source.sessions.len(), 2);
-    assert!(source.sessions[0].days.is_empty());
-    assert_eq!(source.sessions[0].session_id, "outside");
-    let zero = &source.sessions[1].days[0];
-    assert_eq!(zero.totals.tokens, 0);
-    assert_eq!(zero.totals.messages, 1);
-    assert_eq!(zero.clients[0].model_id, "");
-    assert_eq!(source.rows_without_identity["opencode"], 2);
-    assert_eq!(source.rows_without_identity["codex"], 1);
-    assert_eq!(graph.summary.total_tokens, 7);
-    assert_eq!(graph.contributions[0].totals.messages, 3);
-}
-
-#[test]
-fn source_snapshots_cross_pricing_batches_and_are_absent_without_opt_in() {
-    let messages = (0..GRAPH_SINK_BATCH + 1)
-        .map(|_| message("opencode", "same", "2026-03-01", "model", 1))
-        .collect();
-    let graph = snapshot_graph(&ReportOptions::default(), messages);
-    assert_eq!(
-        graph.source_usage.unwrap().sessions[0].days[0]
-            .totals
-            .tokens,
-        (GRAPH_SINK_BATCH + 1) as i64
-    );
-    for requirement in [
-        GraphPricingRequirement::Lenient,
-        GraphPricingRequirement::LenientSourceOnly,
-        GraphPricingRequirement::Submission,
-    ] {
-        let mut row = message("opencode", "same", "2026-03-01", "", 0);
-        row.mark_provider_reported_cost();
-        let pricing = pricing::PricingService::new(
-            HashMap::from([(
-                "fixture".into(),
-                pricing::ModelPricing {
-                    input_cost_per_token: Some(0.0),
-                    ..Default::default()
-                },
-            )]),
-            HashMap::new(),
-        );
-        let graph = build_graph_from_messages(
-            vec![row],
-            Some(&pricing),
-            requirement,
-            Instant::now(),
-            &BucketTimezone::Local,
-        )
-        .unwrap();
-        assert!(graph.source_usage.is_none());
-        assert!(serde_json::to_value(graph)
-            .unwrap()
-            .get("sourceUsage")
-            .is_none());
     }
 }
 
-fn keyed_message(
-    client: &str,
-    session: &str,
-    date: &str,
-    model: &str,
-    tokens: i64,
-    key: &str,
-) -> UnifiedMessage {
-    let mut row = message(client, session, date, model, tokens);
-    row.dedup_key = Some(key.into());
-    row
-}
-
 #[test]
-fn source_snapshots_event_groups_preserve_all_daily_accounting_and_unkeyed_residual() {
-    let mut detailed = keyed_message("opencode", "same", "2026-03-01", "a", 7, "event-a");
+fn source_snapshots_v2_timestamped_accounting_matches_graph_without_duplicate_days() {
+    let mut detailed = message("micode", "same", "2026-03-01", "a", 7, Some("event-a"));
     detailed.tokens.output = 3;
     detailed.tokens.cache_read = 5;
     detailed.tokens.cache_write = 11;
     detailed.tokens.cache_write_1h = 2;
     detailed.tokens.reasoning = 13;
     detailed.message_count = 2;
-    let graph = snapshot_graph(
-        &ReportOptions::default(),
+    let graph = snapshot(
+        &selected(&["micode", "micode-desktop"]),
         vec![
             detailed,
-            keyed_message("opencode", "same", "2026-03-02", "b", 2, "event-a"),
-            keyed_message("opencode", "same", "2026-03-01", "c", 4, "event-b"),
-            message("opencode", "same", "2026-03-02", "", 0),
-            keyed_message("opencode", "same", "2026-03-02", "b", 6, "  "),
+            message("micode", "same", "2026-03-02", "b", 2, Some("event-a")),
+            message("micode", "same", "2026-03-01", "c", 4, Some("event-b")),
+            message("micode", "same", "2026-03-02", "", 0, None),
+            message("micode", "same", "2026-03-02", "b", 6, Some("  ")),
         ],
+        Some(SourceReadEvidence::new("micode", true, true)),
     );
     let source = graph.source_usage.unwrap();
-    assert_eq!(source.event_identity_version, 1);
     let session = &source.sessions[0];
     assert_eq!(session.events.len(), 3);
+    assert_eq!(
+        session.events.iter().map(tokens).sum::<i64>(),
+        graph.summary.total_tokens
+    );
     assert_eq!(
         session
             .events
             .iter()
-            .filter(|event| event.id.is_none())
-            .count(),
-        1
+            .flat_map(|e| &e.contributions)
+            .map(|c| c.messages)
+            .sum::<i32>(),
+        6
     );
-    for day in &session.days {
-        let event_days: Vec<_> = session
+    assert!(
+        (session
             .events
             .iter()
-            .flat_map(|event| &event.days)
-            .filter(|event_day| event_day.date == day.date)
-            .collect();
-        assert_eq!(
-            event_days.iter().map(|day| day.totals.tokens).sum::<i64>(),
-            day.totals.tokens
-        );
-        assert_eq!(
-            event_days
-                .iter()
-                .map(|day| day.totals.messages)
-                .sum::<i32>(),
-            day.totals.messages
-        );
-        assert!(
-            (event_days.iter().map(|day| day.totals.cost).sum::<f64>() - day.totals.cost).abs()
-                < 1e-12
-        );
-        let mut tokens = TokenBreakdown::default();
-        for event_day in &event_days {
-            tokens.input += event_day.token_breakdown.input;
-            tokens.output += event_day.token_breakdown.output;
-            tokens.cache_read += event_day.token_breakdown.cache_read;
-            tokens.cache_write += event_day.token_breakdown.cache_write;
-            tokens.cache_write_1h += event_day.token_breakdown.cache_write_1h;
-            tokens.reasoning += event_day.token_breakdown.reasoning;
-        }
-        assert_eq!(tokens, day.token_breakdown);
-        for model in &day.clients {
-            let groups: Vec<_> = event_days
-                .iter()
-                .flat_map(|day| &day.clients)
-                .filter(|group| {
-                    group.client == model.client
-                        && group.model_id == model.model_id
-                        && group.provider_id == model.provider_id
-                })
-                .collect();
-            assert_eq!(
-                groups.iter().map(|group| group.tokens.total()).sum::<i64>(),
-                model.tokens.total()
-            );
-            assert_eq!(
-                groups.iter().map(|group| group.messages).sum::<i32>(),
-                model.messages
-            );
-            assert!(
-                (groups.iter().map(|group| group.cost).sum::<f64>() - model.cost).abs() < 1e-12
-            );
-        }
-    }
-    let serialized = serde_json::to_string(&source).unwrap();
-    assert!(!serialized.contains("event-a"));
-    assert!(!serialized.contains("event-b"));
-    for event in session.events.iter().filter(|event| event.id.is_some()) {
-        let id = event.id.as_deref().unwrap();
-        assert_eq!(id.len(), 71);
-        assert!(id.starts_with("sha256:"));
-        assert!(id[7..]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
-    }
-}
-
-#[test]
-fn source_snapshots_event_claims_follow_winner_migration_and_keep_partial_overlap() {
-    let old = snapshot_graph(
-        &ReportOptions::default(),
-        vec![
-            keyed_message("opencode", "old", "2026-03-01", "old-model", 100, "shared"),
-            keyed_message(
-                "opencode",
-                "old",
-                "2026-03-02",
-                "retained-model",
-                50,
-                "orphan",
-            ),
-        ],
-    )
-    .source_usage
-    .unwrap();
-    let current = snapshot_graph(
-        &ReportOptions::default(),
-        vec![keyed_message(
-            "opencode",
-            "new",
-            "2026-03-03",
-            "new-model",
-            7,
-            "shared",
-        )],
-    )
-    .source_usage
-    .unwrap();
-    assert_eq!(old.sessions[0].events.len(), 2);
-    let claimed: HashSet<_> = current
-        .sessions
-        .iter()
-        .flat_map(|session| &session.events)
-        .filter_map(|event| event.id.as_ref())
-        .collect();
-    assert!(claimed.contains(
-        &"sha256:2283d654a3e5d8ef486897c248d1a6390f02c830a5ff500637ce48feeaacaec2".to_string()
-    ));
-    let retained: Vec<_> = old.sessions[0]
-        .events
-        .iter()
-        .filter(|event| event.id.as_ref().is_some_and(|id| !claimed.contains(id)))
-        .collect();
-    assert_eq!(retained.len(), 1);
-    assert_eq!(retained[0].days[0].clients[0].model_id, "retained-model");
-    let union_tokens: i64 = retained
-        .iter()
-        .flat_map(|event| &event.days)
-        .chain(current.sessions.iter().flat_map(|session| &session.days))
-        .map(|day| day.totals.tokens)
-        .sum();
-    assert_eq!(union_tokens, 57);
-
-    let old_native = snapshot_graph(
-        &ReportOptions::default(),
-        vec![keyed_message(
-            "antigravity",
-            "legacy-session",
-            "2026-03-01",
-            "model",
-            9,
-            "response",
-        )],
-    )
-    .source_usage
-    .unwrap();
-    for client in ["antigravity-cli", "antigravity-extension"] {
-        let new_native = snapshot_graph(
-            &ReportOptions::default(),
-            vec![keyed_message(
-                client,
-                "native-session",
-                "2026-03-02",
-                "corrected",
-                3,
-                "response",
-            )],
-        )
-        .source_usage
-        .unwrap();
-        assert_eq!(
-            old_native.sessions[0].events[0].id,
-            new_native.sessions[0].events[0].id
-        );
-    }
-    let independent = snapshot_graph(
-        &ReportOptions::default(),
-        vec![keyed_message(
-            "opencode",
-            "other",
-            "2026-03-01",
-            "model",
-            9,
-            "response",
-        )],
-    )
-    .source_usage
-    .unwrap();
-    assert_ne!(
-        old_native.sessions[0].events[0].id,
-        independent.sessions[0].events[0].id
+            .flat_map(|e| &e.contributions)
+            .map(|c| c.cost)
+            .sum::<f64>()
+            - graph.summary.total_cost)
+            .abs()
+            < 1e-12
     );
+    assert_eq!(source.scopes[0].identity_status, "unresolved");
+    let wire = serde_json::to_value(&source).unwrap();
+    assert_eq!(wire["version"], 2);
+    assert_eq!(wire["eventIdentityVersion"], 2);
+    assert!(wire["sessions"][0].get("days").is_none());
+    assert!(wire["sessions"][0]["events"][0].get("days").is_none());
+    let c = &wire["sessions"][0]["events"][1]["contributions"][0];
+    assert!(c["timestamp"].as_i64().unwrap() > 0);
+    assert!(c["tokens"].get("cacheRead").is_some());
+    assert!(c["tokens"].get("cache_write_1h").is_none());
 }
 
 #[test]
-fn source_snapshots_event_groups_cross_batch_boundaries() {
-    let graph = snapshot_graph(
-        &ReportOptions::default(),
-        (0..GRAPH_SINK_BATCH + 3)
-            .map(|index| {
-                keyed_message(
-                    "opencode",
-                    "same",
-                    "2026-03-01",
-                    if index % 2 == 0 { "a" } else { "b" },
-                    1,
-                    "same-event",
-                )
-            })
-            .collect(),
-    );
-    let session = &graph.source_usage.as_ref().unwrap().sessions[0];
-    assert_eq!(session.events.len(), 1);
-    assert_eq!(session.events[0].days[0].totals, session.days[0].totals);
-    for model in &session.days[0].clients {
-        assert_eq!(
-            session.events[0].days[0]
-                .clients
-                .iter()
-                .find(|candidate| candidate.model_id == model.model_id),
-            Some(model)
-        );
-    }
-}
-
-#[test]
-fn source_snapshots_synthetic_only_clients_are_partial_before_date_filtering() {
-    for (selected, expected) in [
-        (vec!["synthetic".into()], Vec::<String>::new()),
+fn source_snapshots_identities_follow_ownership_correction_and_timezone() {
+    for (family, aliases) in [
+        ("micode", vec!["micode-desktop"]),
+        ("claude", vec!["cc-mirror/test"]),
+        ("gjc", vec!["9router", "9Router"]),
         (
-            vec!["opencode".into(), "synthetic".into()],
-            vec!["opencode".into()],
+            "antigravity",
+            vec!["antigravity-cli", "antigravity-extension"],
         ),
     ] {
-        let options = ReportOptions {
-            clients: Some(selected),
-            since: Some("2030-01-01".into()),
-            ..Default::default()
-        };
-        let source = snapshot_graph(
-            &options,
-            vec![
-                keyed_message("opencode", "a", "2026-03-01", "model", 3, "a"),
-                keyed_message("codex", "b", "2026-03-01", "model", 4, "b"),
-            ],
-        )
-        .source_usage
-        .unwrap();
-        assert_eq!(source.replacement_clients, expected);
-        assert!(source.partial_clients.contains(&"codex".into()));
-        assert_eq!(
-            source.partial_clients.contains(&"opencode".into()),
-            source.replacement_clients.is_empty()
+        let old = message(family, "A", "2026-03-01", "old", 100, Some("response"));
+        for alias in aliases {
+            let mut corrected = message(alias, "B", "2026-03-03", "new", 20, Some("response"));
+            corrected.provider_id = "new-provider".into();
+            corrected.rebucket_date(&BucketTimezone::from_pinned_name(Some(
+                "Pacific/Kiritimati",
+            )));
+            assert_eq!(source_event_id(&old), source_event_id(&corrected));
+            assert_eq!(
+                source_scope_id(&old.client),
+                source_scope_id(&corrected.client)
+            );
+        }
+        let independent = message(
+            "independent",
+            "A",
+            "2026-03-01",
+            "old",
+            100,
+            Some("response"),
         );
-        assert!(source
-            .sessions
-            .iter()
-            .all(|session| session.days.is_empty()));
+        assert_ne!(source_event_id(&old), source_event_id(&independent));
+        let id = source_event_id(&old).unwrap();
+        assert_eq!(id.len(), 71);
+        assert!(id.starts_with("sha256:"));
     }
-    let options = ReportOptions {
-        clients: Some(vec!["claude".into(), "gjc".into()]),
-        ..Default::default()
-    };
-    let source = snapshot_graph(
-        &options,
-        vec![
-            keyed_message("cc-mirror/test", "a", "2026-03-01", "model", 3, "a"),
-            keyed_message("9Router", "b", "2026-03-01", "model", 4, "b"),
-        ],
+}
+
+#[test]
+fn source_snapshots_codex_turn_group_survives_mutable_native_keys() {
+    let mut a = message(
+        "codex",
+        "A",
+        "2026-03-01",
+        "old",
+        30,
+        Some("mutable-total-30"),
+    );
+    a.source_group_key = Some(crate::source_snapshot::codex_group_key("upstream", "turn"));
+    let mut b = message(
+        "codex",
+        "A",
+        "2026-03-02",
+        "other",
+        15,
+        Some("mutable-total-45"),
+    );
+    b.session_id = "B-fragment".into();
+    b.source_group_key = a.source_group_key.clone();
+    let old = snapshot(
+        &selected(&["codex"]),
+        vec![a.clone(), b],
+        Some(SourceReadEvidence::new("codex", true, true)),
     )
     .source_usage
     .unwrap();
-    assert!(source.partial_clients.is_empty());
-    for (client, family) in [
-        ("cc-mirror/test", "claude"),
-        ("9router", "gjc"),
-        ("9Router", "gjc"),
-    ] {
-        let alias = keyed_message(client, "alias-session", "2026-03-01", "a", 3, "shared");
-        let parent = keyed_message(family, "parent-session", "2026-03-02", "b", 7, "shared");
-        assert_eq!(
-            crate::source_event_id(&alias),
-            crate::source_event_id(&parent)
-        );
-    }
-    assert_eq!(
-        crate::source_replacement_clients(Some(&["9router".into(), "synthetic".into()])),
-        vec!["9router"]
-    );
+    a.session_id = "B".into();
+    a.model_id = "corrected".into();
+    a.provider_id = "corrected-provider".into();
+    a.tokens.input = 15;
+    a.dedup_key = Some("mutable-total-15".into());
+    let new = snapshot(
+        &selected(&["codex"]),
+        vec![a],
+        Some(SourceReadEvidence::new("codex", true, true)),
+    )
+    .source_usage
+    .unwrap();
+    assert_eq!(old.sessions.len(), 2);
+    assert!(old.sessions[1].events.is_empty());
+    assert_eq!(old.sessions[0].events.len(), 1);
+    assert_eq!(old.sessions[0].events[0].contributions.len(), 2);
+    assert_eq!(tokens(&old.sessions[0].events[0]), 45);
+    assert_eq!(tokens(&new.sessions[0].events[0]), 15);
+    assert_eq!(old.sessions[0].events[0].id, new.sessions[0].events[0].id);
+    assert_eq!(new.scopes[0].identity_status, "exact");
+    let no_turn = message("codex", "C", "2026-03-02", "model", 15, Some("native-key"));
+    let unknown = snapshot(
+        &selected(&["codex"]),
+        vec![no_turn],
+        Some(SourceReadEvidence::new("codex", true, true)),
+    )
+    .source_usage
+    .unwrap();
+    assert_eq!(unknown.scopes[0].identity_status, "unresolved");
+    assert!(unknown.sessions[0].events[0].id.is_none());
 }
 
 #[test]
-fn source_snapshots_explicit_owned_clients_have_scope_without_changing_defaults() {
-    let default_clients = crate::source_replacement_clients(None);
-    for client in crate::token_monitor::client_ids() {
-        assert!(!default_clients.iter().any(|selected| selected == client));
-        let source = snapshot_graph(
-            &ReportOptions {
-                clients: Some(vec![client.into()]),
-                ..Default::default()
-            },
-            vec![keyed_message(
-                client,
-                "owned-session",
-                "2026-03-01",
-                "model",
-                15,
-                "owned",
-            )],
+fn source_snapshots_health_selection_and_date_coverage_are_independent() {
+    for (clients, complete, expected) in [
+        (vec!["micode", "micode-desktop"], true, "complete"),
+        (vec!["micode", "micode-desktop"], false, "partial"),
+        (vec!["micode"], true, "partial"),
+        (vec!["micode-desktop"], true, "partial"),
+    ] {
+        let source = snapshot(
+            &selected(&clients),
+            vec![],
+            Some(SourceReadEvidence::new("micode", complete, true)),
         )
         .source_usage
         .unwrap();
-        assert_eq!(source.replacement_clients, vec![client]);
-        assert!(source.partial_clients.is_empty());
-        assert_eq!(source.sessions[0].client, client);
+        assert!(source.full_history);
+        assert_eq!(source.scopes[0].read_status, expected);
+        assert_eq!(source.scopes[0].clients, ["micode", "micode-desktop"]);
+        if clients.len() == 1 {
+            assert_eq!(source.partial_clients, ["micode", "micode-desktop"]);
+        }
     }
+    let unknown = snapshot(&selected(&["opencode"]), vec![], None)
+        .source_usage
+        .unwrap();
+    assert_eq!(unknown.scopes[0].read_status, "unknown");
+    assert_eq!(unknown.scopes[0].identity_status, "unresolved");
+    let mut window = selected(&["micode", "micode-desktop"]);
+    window.since = Some("2026-03-02".into());
+    let source = snapshot(
+        &window,
+        vec![message(
+            "micode",
+            "outside",
+            "2026-03-01",
+            "model",
+            15,
+            Some("id"),
+        )],
+        Some(SourceReadEvidence::new("micode", true, true)),
+    )
+    .source_usage
+    .unwrap();
+    assert!(!source.full_history);
+    assert_eq!(source.scopes[0].read_status, "complete");
+    assert!(source.sessions[0].events.is_empty());
+    let synthetic = snapshot(
+        &selected(&["synthetic"]),
+        vec![message(
+            "opencode",
+            "sid",
+            "2026-03-01",
+            "model",
+            15,
+            Some("id"),
+        )],
+        None,
+    )
+    .source_usage
+    .unwrap();
+    assert!(synthetic.replacement_clients.is_empty());
+    assert_eq!(synthetic.partial_clients, ["opencode"]);
 }
 
 #[test]
-fn source_snapshots_copilot_unknown_session_is_aggregate_only() {
-    let graph = snapshot_graph(
+fn source_snapshots_inventory_zero_ids_gaps_batches_and_owner_partitions() {
+    let mut evidence = SourceReadEvidence::new("micode", true, true);
+    evidence.sessions.push(("micode".into(), "empty".into()));
+    evidence
+        .sessions
+        .push(("micode-desktop".into(), "empty-desktop".into()));
+    let graph = snapshot(
+        &selected(&["micode", "micode-desktop"]),
+        vec![
+            message("micode", "zero", "2026-03-02", "", 0, Some("zero")),
+            message(
+                "micode",
+                "unknown",
+                "2026-03-02",
+                "model",
+                3,
+                Some("missing"),
+            ),
+        ],
+        Some(evidence),
+    );
+    let source = graph.source_usage.unwrap();
+    assert_eq!(source.sessions.len(), 3);
+    assert_eq!(source.rows_without_identity["micode"], 1);
+    assert_eq!(
+        source
+            .sessions
+            .iter()
+            .filter(|s| s.events.is_empty())
+            .count(),
+        2
+    );
+    assert_eq!(
+        source
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "zero")
+            .unwrap()
+            .events[0]
+            .contributions[0]
+            .messages,
+        1
+    );
+    let rows = (0..GRAPH_SINK_BATCH + 1)
+        .map(|_| message("micode", "same", "2026-03-01", "model", 1, Some("same")))
+        .collect();
+    let graph = snapshot(
+        &selected(&["micode", "micode-desktop"]),
+        rows,
+        Some(SourceReadEvidence::new("micode", true, true)),
+    );
+    assert_eq!(
+        tokens(&graph.source_usage.unwrap().sessions[0].events[0]),
+        (GRAPH_SINK_BATCH + 1) as i64
+    );
+    let graph = snapshot(
         &ReportOptions::default(),
         vec![
-            keyed_message(
+            message("opencode", "shared", "2026-03-01", "model", 5, Some("same")),
+            message("micode", "shared", "2026-03-01", "model", 7, Some("same")),
+            message(
                 "copilot",
                 "unknown-session",
                 "2026-03-01",
                 "model",
                 11,
-                "span",
-            ),
-            keyed_message(
-                "copilot",
-                "trace-fallback",
-                "2026-03-01",
-                "model",
-                2,
-                "trace:span",
-            ),
-            keyed_message(
-                "opencode",
-                "unknown-session",
-                "2026-03-01",
-                "model",
-                3,
-                "native-id",
+                Some("span"),
             ),
         ],
+        None,
     );
-    assert_eq!(graph.summary.total_tokens, 16);
     let source = graph.source_usage.unwrap();
-    assert_eq!(source.rows_without_identity["copilot"], 1);
     assert_eq!(source.sessions.len(), 2);
-    assert!(!source
-        .sessions
-        .iter()
-        .any(|session| session.client == "copilot" && session.session_id == "unknown-session"));
-    assert!(source
-        .sessions
-        .iter()
-        .any(|session| session.session_id == "trace-fallback"));
+    assert_eq!(source.rows_without_identity["copilot"], 1);
+    assert_eq!(graph.summary.total_tokens, 23);
+    assert_ne!(
+        source.sessions[0].events[0].id,
+        source.sessions[1].events[0].id
+    );
+    for client in crate::token_monitor::client_ids() {
+        assert!(!crate::source_replacement_clients(None).contains(&client.to_string()));
+        assert_eq!(
+            crate::source_replacement_clients(Some(&[client.into()])),
+            [client]
+        );
+    }
+}
+
+#[test]
+fn source_snapshots_are_absent_without_opt_in() {
+    for requirement in [
+        GraphPricingRequirement::Lenient,
+        GraphPricingRequirement::LenientSourceOnly,
+    ] {
+        let graph = build_graph_from_messages(
+            vec![message(
+                "micode",
+                "same",
+                "2026-03-01",
+                "model",
+                1,
+                Some("id"),
+            )],
+            None,
+            requirement,
+            Instant::now(),
+            &BucketTimezone::from_pinned_name(Some("Etc/UTC")),
+        )
+        .unwrap();
+        assert!(graph.source_usage.is_none());
+    }
 }

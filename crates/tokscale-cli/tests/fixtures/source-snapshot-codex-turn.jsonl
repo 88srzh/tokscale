@@ -1,0 +1,4 @@
+{"timestamp":"2026-03-02T00:00:00Z","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-000000000001","source":"cli","model_provider":"openai"}}
+{"timestamp":"2026-03-02T00:00:00Z","type":"turn_context","payload":{"turn_id":"stable-turn","model":"gpt-5.4"}}
+{"timestamp":"2026-03-02T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":30,"cached_input_tokens":0,"output_tokens":0},"last_token_usage":{"input_tokens":30,"cached_input_tokens":0,"output_tokens":0}}}}
+{"timestamp":"2026-03-02T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":45,"cached_input_tokens":0,"output_tokens":0},"last_token_usage":{"input_tokens":15,"cached_input_tokens":0,"output_tokens":0}}}}

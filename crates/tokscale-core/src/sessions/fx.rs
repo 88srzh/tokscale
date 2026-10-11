@@ -342,6 +342,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
             message_count: model_usage.request_count.unwrap_or(0).max(0) as i32,
             agent: None,
             dedup_key: Some(dedup_key),
+            source_group_key: None,
             // Resolved after the cache by `apply_session_titles`; see the
             // module docs for why the shared index stays out of the parse.
             session_title: None,
@@ -385,6 +386,7 @@ pub fn parse_fx_file(path: &Path) -> Vec<UnifiedMessage> {
                 message_count: request_count as i32,
                 agent: None,
                 dedup_key: Some(format!("fx:{session_id}:{UNKNOWN_MODEL}")),
+                source_group_key: None,
                 session_title: None,
                 parent_session_id: None,
                 is_turn_start: false,

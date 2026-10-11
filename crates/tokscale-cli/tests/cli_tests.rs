@@ -7835,136 +7835,124 @@ fn snapshot_export(home: &Path, extra: &[&str]) -> serde_json::Value {
     serde_json::from_slice(&output).unwrap()
 }
 
+fn source_events(source: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    source["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|s| s["events"].as_array().unwrap())
+}
+fn source_tokens(source: &serde_json::Value) -> i64 {
+    source_events(source)
+        .flat_map(|e| e["contributions"].as_array().unwrap())
+        .map(|c| {
+            ["input", "output", "cacheRead", "cacheWrite", "reasoning"]
+                .iter()
+                .map(|key| c["tokens"][key].as_i64().unwrap())
+                .sum::<i64>()
+        })
+        .sum()
+}
+fn native_graph(home: &Path, clients: &str) -> serde_json::Value {
+    let bytes = cmd_with_home(home)
+        .args(["graph", "--client", clients, "--no-spinner"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&bytes).unwrap()
+}
+fn only_scope(graph: &serde_json::Value) -> &serde_json::Value {
+    let scopes = graph["sourceUsage"]["scopes"].as_array().unwrap();
+    assert_eq!(scopes.len(), 1);
+    &scopes[0]
+}
+
 #[test]
-fn test_graph_source_snapshots_contract_timezone_and_identity_residual() {
+fn test_graph_source_snapshots_v2_contract_timestamp_projection_and_default_output() {
     let tmp = source_snapshot_fixture();
     let before = chrono::Utc::now();
     let graph = snapshot_export(tmp.path(), &["--client", "opencode"]);
     let after = chrono::Utc::now();
     let source = &graph["sourceUsage"];
-    assert_eq!(source["version"], 1);
-    assert_eq!(source["eventIdentityVersion"], 1);
+    assert_eq!(source["version"], 2);
+    assert_eq!(source["eventIdentityVersion"], 2);
     assert_eq!(source["fullHistory"], true);
     assert_eq!(
         source["replacementClients"],
         serde_json::json!(["opencode"])
     );
-    assert_eq!(source["partialClients"], serde_json::json!([]));
-    assert_eq!(source["bucketTimezone"], "Pacific/Kiritimati");
+    assert_eq!(source["rowsWithoutIdentity"]["opencode"], 2);
+    assert_eq!(only_scope(&graph)["readStatus"], "unknown");
+    assert_eq!(only_scope(&graph)["identityStatus"], "unresolved");
     let captured =
         chrono::DateTime::parse_from_rfc3339(source["capturedAt"].as_str().unwrap()).unwrap();
     assert!(captured >= before && captured <= after);
-    let zone =
-        tokscale_core::bucket_tz::BucketTimezone::from_pinned_name(Some("Pacific/Kiritimati"));
+    let zone = tokscale_core::bucket_tz::BucketTimezone::from_pinned_name(
+        source["bucketTimezone"].as_str(),
+    );
     assert_eq!(source["dayKey"], zone.day_key(captured.timestamp_millis()));
-    assert_eq!(source["rowsWithoutIdentity"]["opencode"], 2);
     let sessions = source["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 2);
     let session = sessions
         .iter()
         .find(|s| s["sessionId"] == "session1")
         .unwrap();
-    let days = session["days"].as_array().unwrap();
-    assert_eq!(days.len(), 2);
-    assert_eq!(days[0]["date"], "2026-03-02");
-    assert_eq!(days[1]["date"], "2026-03-03");
-    assert_eq!(session["events"].as_array().unwrap().len(), 2);
-    for event in session["events"].as_array().unwrap() {
+    assert_eq!(session["scopeId"], only_scope(&graph)["id"]);
+    assert!(session.get("days").is_none());
+    let mut dates = std::collections::BTreeSet::new();
+    for event in source_events(source) {
+        assert!(event.get("days").is_none());
         let id = event["id"].as_str().unwrap();
-        assert_eq!(id.len(), 71);
         assert!(id.starts_with("sha256:"));
-        for day in event["days"].as_array().unwrap() {
-            let session_day = days
-                .iter()
-                .find(|candidate| candidate["date"] == day["date"])
-                .unwrap();
-            assert_eq!(day, session_day);
+        assert_eq!(id.len(), 71);
+        for c in event["contributions"].as_array().unwrap() {
+            dates.insert(zone.day_key(c["timestamp"].as_i64().unwrap()));
+            assert!(c.get("modelId").is_some());
+            assert!(c.get("providerId").is_some());
+            assert!(c["tokens"].get("cacheRead").is_some());
+            assert!(c["tokens"].get("cache_read").is_none());
         }
     }
-    assert_eq!(days[0]["clients"][0]["tokens"]["cacheRead"], 0);
-    assert!(days[0].get("token_breakdown").is_none());
-    assert!(days[0]["clients"][0].get("model_id").is_none());
-    assert!(days[0]["clients"][0].get("modelId").is_some());
-    assert!(days[0].get("tokenBreakdown").is_some());
+    assert_eq!(
+        dates.into_iter().collect::<Vec<_>>(),
+        ["2026-03-02", "2026-03-03"]
+    );
     let zero = sessions
         .iter()
         .find(|s| s["sessionId"] == "zero-session")
         .unwrap();
-    assert_eq!(zero["days"][0]["totals"]["tokens"], 0);
-    assert_eq!(zero["days"][0]["totals"]["messages"], 1);
+    assert_eq!(zero["events"][0]["contributions"][0]["messages"], 1);
+    assert_eq!(source_tokens(source), 30);
     assert_eq!(graph["summary"]["totalTokens"], 37);
-    assert!(!serde_json::to_string(source)
-        .unwrap()
-        .contains("messages\": ["));
-}
-
-#[test]
-fn test_graph_source_snapshots_filters_and_opt_in_serialization() {
-    let tmp = source_snapshot_fixture();
-    let all = snapshot_export(tmp.path(), &[]);
-    assert_eq!(all["sourceUsage"]["sessions"].as_array().unwrap().len(), 2);
-    assert!(all["sourceUsage"]["replacementClients"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|client| client == "opencode"));
-    assert_eq!(all["sourceUsage"]["partialClients"], serde_json::json!([]));
-    for filter in [
-        vec!["--since", "2030-01-01"],
-        vec!["--until", "2020-01-01"],
-        vec!["--year", "2020"],
-    ] {
-        let mut args = vec!["--client", "opencode"];
-        args.extend(filter);
-        let graph = snapshot_export(tmp.path(), &args);
-        assert_eq!(graph["sourceUsage"]["fullHistory"], false);
-        assert_eq!(graph["summary"]["totalTokens"], 0);
-        let sessions = graph["sourceUsage"]["sessions"].as_array().unwrap();
-        assert_eq!(sessions.len(), 2);
-        assert!(sessions
-            .iter()
-            .all(|s| s["days"].as_array().unwrap().is_empty()));
-        assert!(sessions
-            .iter()
-            .all(|s| s["events"].as_array().unwrap().is_empty()));
-    }
-    let excluded = snapshot_export(tmp.path(), &["--client", "codex"]);
-    assert_eq!(excluded["sourceUsage"]["fullHistory"], true);
-    assert!(excluded["sourceUsage"]["sessions"]
-        .as_array()
-        .unwrap()
-        .is_empty());
-    assert!(excluded["sourceUsage"]["rowsWithoutIdentity"]
-        .as_object()
-        .unwrap()
-        .is_empty());
-    let normal = cmd_with_home(tmp.path())
-        .args(["graph", "--client", "opencode", "--no-spinner"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let normal: serde_json::Value = serde_json::from_slice(&normal).unwrap();
+    let normal = native_graph(tmp.path(), "opencode");
     assert!(normal.get("sourceUsage").is_none());
-    assert_eq!(normal["contributions"], all["contributions"]);
+    assert_eq!(normal["contributions"], graph["contributions"]);
     for command in ["submit", "import"] {
         cmd_with_home(tmp.path())
             .args([command, "--source-snapshots", "--no-spinner"])
             .assert()
-            .failure()
-            .stderr(predicate::str::contains("source-snapshots"));
+            .failure();
+    }
+    let mut window_args = vec!["--client", "opencode", "--since", "2026-03-04"];
+    for _ in 0..2 {
+        let window = snapshot_export(tmp.path(), &window_args);
+        assert_eq!(window["sourceUsage"]["fullHistory"], false);
+        assert_eq!(
+            window["sourceUsage"]["sessions"].as_array().unwrap().len(),
+            2
+        );
+        assert!(source_events(&window["sourceUsage"]).next().is_none());
+        window_args = vec!["--client", "opencode", "--year", "2040"];
     }
 }
 
 #[test]
-fn test_graph_source_snapshots_refresh_coherent_priced_deduplicated_session() {
+fn test_graph_source_snapshots_pricing_correction_and_raw_alias_scopes() {
     let tmp = source_snapshot_fixture();
-    // A complete override also affects provider-reported cost; snapshots must
-    // see exactly the priced/deduplicated stream used by aggregate graph days.
-    let config = tmp.path().join(".config/tokscale");
     fs::write(
-        config.join("custom-pricing.json"),
+        tmp.path().join(".config/tokscale/custom-pricing.json"),
         r#"{"models":{"model-a":{"input_cost_per_token":1},"model-b":{"input_cost_per_token":2}}}"#,
     )
     .unwrap();
@@ -7972,272 +7960,562 @@ fn test_graph_source_snapshots_refresh_coherent_priced_deduplicated_session() {
         .path()
         .join(".local/share/opencode/storage/message/session1");
     fs::copy(dir.join("a.json"), dir.join("duplicate-a.json")).unwrap();
-    let first = snapshot_export(tmp.path(), &["--client", "opencode"]);
-    let session = first["sourceUsage"]["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["sessionId"] == "session1")
-        .unwrap();
-    assert_eq!(session["days"][0]["totals"]["tokens"], 10);
-    assert_eq!(session["days"][0]["totals"]["messages"], 1);
-    assert_eq!(session["days"][0]["totals"]["cost"], 10.0);
-    assert_eq!(session["days"][1]["totals"]["cost"], 40.0);
-    for day in session["days"].as_array().unwrap() {
-        let aggregate = first["contributions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|d| d["date"] == day["date"])
-            .unwrap();
-        assert!(
-            day["totals"]["cost"].as_f64().unwrap()
-                <= aggregate["totals"]["cost"].as_f64().unwrap()
-        );
-    }
-    fs::remove_file(dir.join("a.json")).unwrap();
-    fs::remove_file(dir.join("duplicate-a.json")).unwrap();
-    let mut row: serde_json::Value =
-        serde_json::from_slice(&fs::read(dir.join("b.json")).unwrap()).unwrap();
-    row["tokens"]["input"] = serde_json::json!(2);
-    row["modelID"] = serde_json::json!("model-a");
-    fs::write(dir.join("b.json"), serde_json::to_vec(&row).unwrap()).unwrap();
-    let corrected = snapshot_export(tmp.path(), &["--client", "opencode"]);
-    let session = corrected["sourceUsage"]["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["sessionId"] == "session1")
-        .unwrap();
-    assert_eq!(session["days"].as_array().unwrap().len(), 1);
-    assert_eq!(session["days"][0]["date"], "2026-03-03");
-    assert_eq!(session["days"][0]["totals"]["tokens"], 2);
-    assert_eq!(session["days"][0]["totals"]["cost"], 2.0);
-    assert_eq!(session["days"][0]["clients"][0]["modelId"], "model-a");
-}
-
-#[test]
-fn test_graph_source_snapshots_resolve_local_zone_without_a_pin() {
-    let tmp = source_snapshot_fixture();
-    fs::remove_file(tmp.path().join(".config/tokscale/settings.json")).unwrap();
-    let output = cmd_with_home(tmp.path())
-        .env("TZ", "Etc/UTC")
-        .args([
-            "graph",
-            "--source-snapshots",
-            "--client",
-            "opencode",
-            "--no-spinner",
-        ])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let graph: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    let source = &graph["sourceUsage"];
-    let zone = tokscale_core::bucket_tz::BucketTimezone::from_pinned_name(
-        source["bucketTimezone"].as_str(),
-    );
-    assert!(zone.is_pinned());
-    let captured =
-        chrono::DateTime::parse_from_rfc3339(source["capturedAt"].as_str().unwrap()).unwrap();
-    assert_eq!(source["dayKey"], zone.day_key(captured.timestamp_millis()));
-    assert_eq!(source["sessions"].as_array().unwrap().len(), 2);
-}
-
-#[test]
-fn test_graph_source_snapshots_synthetic_selection_has_no_full_client_authority() {
-    let tmp = source_snapshot_fixture();
-    let path = tmp
-        .path()
-        .join(".local/share/opencode/storage/message/session1/a.json");
-    let mut gateway: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    gateway["providerID"] = serde_json::json!("synthetic");
-    fs::write(&path, serde_json::to_vec(&gateway).unwrap()).unwrap();
-    let partial = snapshot_export(tmp.path(), &["--client", "synthetic"]);
-    let source = &partial["sourceUsage"];
-    assert_eq!(source["fullHistory"], true);
-    assert_eq!(source["replacementClients"], serde_json::json!([]));
-    assert_eq!(source["partialClients"], serde_json::json!(["opencode"]));
-    assert_eq!(source["sessions"].as_array().unwrap().len(), 1);
-    assert_eq!(source["sessions"][0]["days"][0]["totals"]["tokens"], 10);
-    let complete = snapshot_export(
-        tmp.path(),
-        &["--client", "opencode", "--client", "synthetic"],
-    );
-    assert_eq!(
-        complete["sourceUsage"]["replacementClients"],
-        serde_json::json!(["opencode"])
-    );
-    assert_eq!(
-        complete["sourceUsage"]["partialClients"],
-        serde_json::json!([])
-    );
-    let default = snapshot_export(tmp.path(), &[]);
-    assert_eq!(default["contributions"], complete["contributions"]);
-    assert!(default["sourceUsage"]["replacementClients"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|client| client == "opencode"));
-    assert_eq!(
-        default["sourceUsage"]["partialClients"],
-        serde_json::json!([])
-    );
-}
-
-#[test]
-fn test_graph_source_snapshots_omitted_session_retains_only_unclaimed_events() {
-    let tmp = source_snapshot_fixture();
     let old = snapshot_export(tmp.path(), &["--client", "opencode"]);
     let old_session = old["sourceUsage"]["sessions"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|session| session["sessionId"] == "session1")
+        .find(|s| s["sessionId"] == "session1")
         .unwrap();
-    let old_dir = tmp
-        .path()
-        .join(".local/share/opencode/storage/message/session1");
-    let new_dir = tmp
-        .path()
-        .join(".local/share/opencode/storage/message/new-session");
-    fs::create_dir_all(&new_dir).unwrap();
-    let mut row: serde_json::Value =
-        serde_json::from_slice(&fs::read(old_dir.join("a.json")).unwrap()).unwrap();
-    row["sessionID"] = serde_json::json!("new-session");
-    row["tokens"]["input"] = serde_json::json!(2);
-    row["modelID"] = serde_json::json!("corrected-model");
-    fs::write(new_dir.join("a.json"), serde_json::to_vec(&row).unwrap()).unwrap();
-    fs::remove_file(old_dir.join("a.json")).unwrap();
-    fs::remove_file(old_dir.join("b.json")).unwrap();
-    let current = snapshot_export(tmp.path(), &["--client", "opencode"]);
-    assert!(!current["sourceUsage"]["sessions"]
+    let old_cost: f64 = old_session["events"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|session| session["sessionId"] == "session1"));
-    let new_session = current["sourceUsage"]["sessions"]
+        .flat_map(|e| e["contributions"].as_array().unwrap())
+        .map(|c| c["cost"].as_f64().unwrap())
+        .sum();
+    assert_eq!(old_cost, 50.0);
+    fs::remove_file(dir.join("duplicate-a.json")).unwrap();
+    let row_path = dir.join("a.json");
+    let mut row: serde_json::Value = serde_json::from_slice(&fs::read(&row_path).unwrap()).unwrap();
+    fs::remove_file(dir.join("b.json")).unwrap();
+    row["sessionID"] = "new-owner".into();
+    row["tokens"]["input"] = 2.into();
+    row["modelID"] = "corrected-model".into();
+    row["cost"] = 0.02.into();
+    fs::write(&row_path, serde_json::to_vec(&row).unwrap()).unwrap();
+    let new = snapshot_export(tmp.path(), &["--client", "opencode"]);
+    let new_session = new["sourceUsage"]["sessions"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|session| session["sessionId"] == "new-session")
+        .find(|s| s["sessionId"] == "new-owner")
         .unwrap();
-    let new_events = new_session["events"].as_array().unwrap();
-    assert_eq!(new_events.len(), 1);
-    let old_events = old_session["events"].as_array().unwrap();
-    assert!(old_events
+    assert_eq!(new_session["events"].as_array().unwrap().len(), 1);
+    assert!(old_session["events"]
+        .as_array()
+        .unwrap()
         .iter()
-        .any(|event| event["id"] == new_events[0]["id"]));
-    let retained: Vec<_> = old_events
-        .iter()
-        .filter(|event| event["id"] != new_events[0]["id"])
-        .collect();
-    assert_eq!(retained.len(), 1);
-    assert_eq!(retained[0]["days"][0]["totals"]["tokens"], 20);
-    assert_eq!(retained[0]["days"][0]["clients"][0]["modelId"], "model-b");
-    assert_eq!(new_events[0]["days"][0]["totals"]["tokens"], 2);
+        .any(|e| e["id"] == new_session["events"][0]["id"]));
     assert_eq!(
-        new_events[0]["days"][0]["clients"][0]["modelId"],
-        "corrected-model"
+        new_session["events"][0]["contributions"][0]["tokens"]["input"],
+        2
     );
-    assert_eq!(new_events[0]["days"], new_session["days"]);
-}
-
-#[test]
-fn test_graph_source_snapshots_owned_client_and_casefolded_alias_scope() {
-    let tmp = source_snapshot_fixture();
+    let mut gateway = row;
+    gateway["providerID"] = "synthetic".into();
+    fs::write(&row_path, serde_json::to_vec(&gateway).unwrap()).unwrap();
+    let partial = snapshot_export(tmp.path(), &["--client", "synthetic"]);
+    assert_eq!(
+        partial["sourceUsage"]["replacementClients"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        partial["sourceUsage"]["partialClients"],
+        serde_json::json!(["opencode"])
+    );
+    assert_eq!(only_scope(&partial)["readStatus"], "partial");
     let proma = tmp.path().join(".proma/agent-sessions/session.jsonl");
     fs::create_dir_all(proma.parent().unwrap()).unwrap();
-    fs::write(
-        &proma,
-        serde_json::json!({
-            "type": "assistant", "timestamp": "2026-03-02T00:00:00Z",
-            "message": {"id": "owned-turn", "model": "claude-sonnet-4",
-                "usage": {"input_tokens": 10, "output_tokens": 5}}
-        })
-        .to_string(),
-    )
-    .unwrap();
+    fs::write(&proma, serde_json::json!({"type":"assistant","timestamp":"2026-03-02T00:00:00Z","message":{"id":"owned-turn","model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":5}}}).to_string()).unwrap();
     let owned = snapshot_export(tmp.path(), &["--client", "proma"]);
     assert_eq!(
         owned["sourceUsage"]["replacementClients"],
         serde_json::json!(["proma"])
     );
-    assert_eq!(
-        owned["sourceUsage"]["partialClients"],
-        serde_json::json!([])
-    );
-    assert_eq!(owned["summary"]["totalTokens"], 15);
-
+    assert_eq!(only_scope(&owned)["readStatus"], "unknown");
     let gjc = tmp.path().join(".gjc/agent/sessions/project/session.jsonl");
     fs::create_dir_all(gjc.parent().unwrap()).unwrap();
-    let mut ids = Vec::new();
+    let mut ids = vec![];
     for alias in ["9Router", "9router", "gjc"] {
-        fs::write(&gjc, format!("{}\n{}\n",
-            serde_json::json!({"type": "session", "id": "native-session", "cwd": "/fixture"}),
-            serde_json::json!({"type": "message", "id": "same-message", "message": {
-                "role": "assistant", "model": "model-a", "provider": "provider", "source": alias,
-                "timestamp": 1772474400000i64,
-                "usage": {"input": 10, "output": 5, "cost": {"total": 0.2}}
-            }})
-        )).unwrap();
+        fs::write(&gjc, format!("{}\n{}\n",serde_json::json!({"type":"session","id":"native-session","cwd":"/fixture"}),serde_json::json!({"type":"message","id":"same-message","message":{"role":"assistant","model":"model-a","provider":"provider","source":alias,"timestamp":1772474400000i64,"usage":{"input":10,"output":5,"cost":{"total":0.2}}}}))).unwrap();
         let graph = snapshot_export(tmp.path(), &["--client", "gjc"]);
+        assert_eq!(graph["sourceUsage"]["sessions"][0]["client"], alias);
+        ids.push(graph["sourceUsage"]["sessions"][0]["events"][0]["id"].clone());
         assert_eq!(
             graph["sourceUsage"]["partialClients"],
             serde_json::json!([])
         );
-        assert_eq!(graph["sourceUsage"]["sessions"][0]["client"], alias);
-        ids.push(graph["sourceUsage"]["sessions"][0]["events"][0]["id"].clone());
     }
     assert!(ids.windows(2).all(|pair| pair[0] == pair[1]));
+    let partial_family = snapshot_export(tmp.path(), &["--client", "9router"]);
+    assert_eq!(only_scope(&partial_family)["readStatus"], "partial");
+}
+
+fn codex_snapshot_fixture(
+    home: &Path,
+    tokens: i64,
+    malformed: bool,
+    turn: bool,
+) -> std::path::PathBuf {
+    let path = home.join(".codex/sessions/2026/03/02/rollout-2026-03-02T00-00-00-01900000-0000-7000-8000-000000000001.jsonl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut rows: Vec<serde_json::Value> =
+        include_str!("fixtures/source-snapshot-codex-turn.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    if tokens != 45 {
+        rows.truncate(3);
+        rows[2]["payload"]["info"]["total_token_usage"]["input_tokens"] = tokens.into();
+        rows[2]["payload"]["info"]["last_token_usage"]["input_tokens"] = tokens.into();
+    }
+    if !turn {
+        rows[1]["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("turn_id");
+    }
+    let mut data = rows
+        .iter()
+        .map(|r| r.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    if malformed {
+        data.push_str("{malformed-json\n");
+    }
+    fs::write(&path, data).unwrap();
+    path
 }
 
 #[test]
-fn test_graph_source_snapshots_copilot_sentinel_and_trace_fallback_contract() {
+fn test_graph_source_snapshots_codex_complete45_partial15_complete15_cache_and_empty_inventory() {
     let tmp = source_snapshot_fixture();
-    let dir = tmp.path().join(".copilot/otel");
-    fs::create_dir_all(&dir).unwrap();
-    let mut rows = Vec::new();
-    for (span, trace, session, input) in [
-        ("missing", None, None, 11),
-        ("traced", Some("trace-fallback"), None, 3),
-        ("real", Some("real-trace"), Some("real-session"), 5),
-    ] {
-        let mut row = serde_json::json!({"type":"span","spanId":span,"name":"chat model-a","startTime":[1772474400i64,0],"attributes":{"gen_ai.operation.name":"chat","gen_ai.response.model":"model-a","gen_ai.usage.input_tokens":input}});
-        if let Some(trace) = trace {
-            row["traceId"] = serde_json::json!(trace);
-        }
-        if let Some(session) = session {
-            row["attributes"]["gen_ai.conversation.id"] = serde_json::json!(session);
-        }
-        rows.push(serde_json::to_string(&row).unwrap());
+    let path = codex_snapshot_fixture(tmp.path(), 45, false, true);
+    // Populate and reload normal persistent cache before observing fresh health.
+    for _ in 0..2 {
+        assert_eq!(
+            native_graph(tmp.path(), "codex")["summary"]["totalTokens"],
+            45
+        );
     }
-    fs::write(dir.join("usage.jsonl"), rows.join("\n")).unwrap();
-    let graph = snapshot_export(tmp.path(), &["--client", "copilot"]);
-    assert_eq!(graph["summary"]["totalTokens"], 19);
-    let source = &graph["sourceUsage"];
-    assert_eq!(source["rowsWithoutIdentity"]["copilot"], 1);
-    let sessions = source["sessions"].as_array().unwrap();
-    assert_eq!(sessions.len(), 2);
-    assert!(sessions
-        .iter()
-        .any(|session| session["sessionId"] == "trace-fallback"));
-    assert!(sessions
-        .iter()
-        .any(|session| session["sessionId"] == "real-session"));
-    assert!(!sessions
-        .iter()
-        .any(|session| session["sessionId"] == "unknown-session"));
+    let old = snapshot_export(tmp.path(), &["--client", "codex"]);
+    assert_eq!(source_tokens(&old["sourceUsage"]), 45);
+    assert_eq!(only_scope(&old)["readStatus"], "complete");
+    assert_eq!(only_scope(&old)["identityStatus"], "exact");
+    let old_event = source_events(&old["sourceUsage"]).next().unwrap();
+    assert_eq!(old_event["contributions"].as_array().unwrap().len(), 2);
+    let id = old_event["id"].clone();
+    // A separate normal cache scan retains group metadata during incremental append.
+    let full = fs::read_to_string(&path).unwrap();
+    let prefix = full.lines().take(3).collect::<Vec<_>>().join("\n") + "\n";
+    fs::write(&path, &prefix).unwrap();
     assert_eq!(
-        sessions
-            .iter()
-            .flat_map(|session| session["days"].as_array().unwrap())
-            .map(|day| day["totals"]["tokens"].as_i64().unwrap())
-            .sum::<i64>(),
-        8
+        native_graph(tmp.path(), "codex")["summary"]["totalTokens"],
+        30
     );
+    fs::write(&path, &full).unwrap();
+    assert_eq!(
+        native_graph(tmp.path(), "codex")["summary"]["totalTokens"],
+        45
+    );
+    let after_append = snapshot_export(tmp.path(), &["--client", "codex"]);
+    assert_eq!(
+        source_events(&after_append["sourceUsage"]).next().unwrap()["id"],
+        id
+    );
+    codex_snapshot_fixture(tmp.path(), 15, true, true);
+    // Ordinary parser still emits the readable 15; export must report partial.
+    assert_eq!(
+        native_graph(tmp.path(), "codex")["summary"]["totalTokens"],
+        15
+    );
+    for _ in 0..2 {
+        let partial = snapshot_export(tmp.path(), &["--client", "codex"]);
+        assert_eq!(partial["sourceUsage"]["fullHistory"], true);
+        assert_eq!(only_scope(&partial)["readStatus"], "partial");
+        assert_eq!(source_tokens(&partial["sourceUsage"]), 15);
+        assert_eq!(
+            source_events(&partial["sourceUsage"]).next().unwrap()["id"],
+            id
+        );
+    }
+    codex_snapshot_fixture(tmp.path(), 15, false, true);
+    let corrected = snapshot_export(tmp.path(), &["--client", "codex"]);
+    assert_eq!(source_tokens(&corrected["sourceUsage"]), 15);
+    assert_eq!(only_scope(&corrected)["readStatus"], "complete");
+    assert_eq!(only_scope(&corrected)["identityStatus"], "exact");
+    assert_eq!(
+        source_events(&corrected["sourceUsage"]).next().unwrap()["id"],
+        id
+    );
+    assert_eq!(
+        corrected["contributions"],
+        native_graph(tmp.path(), "codex")["contributions"]
+    );
+    // Ownership changes leave the upstream turn identity unchanged.
+    let moved = path
+        .with_file_name("rollout-2026-03-02T00-00-00-01900000-0000-7000-8000-000000000002.jsonl");
+    fs::rename(&path, &moved).unwrap();
+    let transferred = snapshot_export(tmp.path(), &["--client", "codex"]);
+    assert_ne!(
+        transferred["sourceUsage"]["sessions"][0]["sessionId"],
+        corrected["sourceUsage"]["sessions"][0]["sessionId"]
+    );
+    assert_eq!(
+        source_events(&transferred["sourceUsage"]).next().unwrap()["id"],
+        id
+    );
+    // Restore the fixture path for no-turn and explicit-empty diagnostics.
+    fs::rename(&moved, &path).unwrap();
+    codex_snapshot_fixture(tmp.path(), 15, false, false);
+    let unresolved = snapshot_export(tmp.path(), &["--client", "codex"]);
+    assert_eq!(only_scope(&unresolved)["readStatus"], "complete");
+    assert_eq!(only_scope(&unresolved)["identityStatus"], "unresolved");
+    assert!(source_events(&unresolved["sourceUsage"]).next().unwrap()["id"].is_null());
+    let meta = include_str!("fixtures/source-snapshot-codex-turn.jsonl")
+        .lines()
+        .next()
+        .unwrap();
+    fs::write(&path, format!("{meta}\n")).unwrap();
+    let empty = snapshot_export(tmp.path(), &["--client", "codex"]);
+    assert_eq!(only_scope(&empty)["readStatus"], "complete");
+    assert_eq!(only_scope(&empty)["identityStatus"], "exact");
+    assert_eq!(
+        empty["sourceUsage"]["sessions"].as_array().unwrap().len(),
+        1
+    );
+    assert!(source_events(&empty["sourceUsage"]).next().is_none());
+    fs::write(&path, "").unwrap();
+    let uninventoried = snapshot_export(tmp.path(), &["--client", "codex"]);
+    assert!(uninventoried["sourceUsage"]["sessions"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn test_graph_source_snapshots_codex_schema_invalid_usage_is_partial_with_warm_native_cache() {
+    let tmp = source_snapshot_fixture();
+    let path = codex_snapshot_fixture(tmp.path(), 45, false, true);
+    let initial = snapshot_export(tmp.path(), &["--client", "codex"]);
+    let id = source_events(&initial["sourceUsage"]).next().unwrap()["id"].clone();
+    let invalid_records = [
+        include_str!("fixtures/source-snapshot-codex-schema-invalid.jsonl").trim(),
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":"invalid-schema"}}}"#,
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{}}}}"#,
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":null}}}}"#,
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":-1}}}}"#,
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1.5}}}}"#,
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":18446744073709551615}}}}"#,
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"prompt_tokens":45}}}}"#,
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0,"prompt_tokens":45}}}}"#,
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"total_tokens":45}}}}"#,
+        r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0,"total_tokens":45}}}}"#,
+        r#"{"type":"event_msg","payload":{"info":{"last_token_usage":{"input_tokens":45}}}}"#,
+        r#"{"type":"event_msg","payload":{"type":"task_started","started_at":"not-a-number"}}"#,
+        r#"{"type":"token_usage_record","payload":{"usage":{"input_tokens":"not-a-number"}}}"#,
+        r#"{"type":"assistant","usage":{"input_tokens":"not-a-number"}}"#,
+        r#"{"type":"assistant","usage":{"input_tokens":0,"prompt_tokens":45}}"#,
+        r#"{"type":"assistant","usage":{"input_tokens":0,"reasoning_output_tokens":45}}"#,
+        r#"{"type":"assistant","usage":{"input_tokens":0,"total_tokens":45}}"#,
+        r#"{"type":"event_msg","payload":{"type":"user_message","message":"text"},"usage":{"input_tokens":45}}"#,
+        r#"{"type":"assistant","usage":{"input_tokens":0},"response":{"usage":{"input_tokens":45}}}"#,
+        r#"{"type":"result","response":{"usage":{"input_tokens":"not-a-number"}}}"#,
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","usage":{"input_tokens":"not-a-number"}}}"#,
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","usage":{"input_tokens":45}}}"#,
+    ];
+    for invalid in invalid_records {
+        codex_snapshot_fixture(tmp.path(), 15, false, true);
+        let prefix = fs::read_to_string(&path).unwrap();
+        fs::write(&path, format!("{prefix}{invalid}\n")).unwrap();
+        // Native tolerance and its persistent cache remain compatible.
+        for _ in 0..2 {
+            assert_eq!(
+                native_graph(tmp.path(), "codex")["summary"]["totalTokens"],
+                15,
+                "{invalid}"
+            );
+        }
+        for _ in 0..2 {
+            let partial = snapshot_export(tmp.path(), &["--client", "codex"]);
+            assert_eq!(only_scope(&partial)["readStatus"], "partial", "{invalid}");
+            assert_eq!(partial["sourceUsage"]["fullHistory"], true);
+            assert_eq!(source_tokens(&partial["sourceUsage"]), 15);
+            assert_eq!(
+                source_events(&partial["sourceUsage"]).next().unwrap()["id"],
+                id
+            );
+            assert_eq!(
+                partial["contributions"],
+                native_graph(tmp.path(), "codex")["contributions"]
+            );
+        }
+    }
+    codex_snapshot_fixture(tmp.path(), 15, false, true);
+    let prefix = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        format!(
+            "{prefix}{}\n{}\n",
+            r#"{"type":"future_non_usage","payload":{"info":"unknown-schema"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{}}}"#,
+        ),
+    )
+    .unwrap();
+    let correction = snapshot_export(tmp.path(), &["--client", "codex"]);
+    assert_eq!(only_scope(&correction)["readStatus"], "complete");
+    assert_eq!(only_scope(&correction)["identityStatus"], "exact");
+    assert_eq!(source_tokens(&correction["sourceUsage"]), 15);
+    assert_eq!(
+        source_events(&correction["sourceUsage"]).next().unwrap()["id"],
+        id
+    );
+    codex_snapshot_fixture(tmp.path(), 0, false, true);
+    let zero = snapshot_export(tmp.path(), &["--client", "codex"]);
+    assert_eq!(only_scope(&zero)["readStatus"], "complete");
+    assert_eq!(only_scope(&zero)["identityStatus"], "exact");
+    assert_eq!(zero["sourceUsage"]["sessions"].as_array().unwrap().len(), 1);
+    assert!(source_events(&zero["sourceUsage"]).next().is_none());
+}
+
+fn write_snapshot_mimo(
+    home: &Path,
+    desktop: bool,
+    input: i64,
+    explicit: bool,
+) -> std::path::PathBuf {
+    let path = home.join(".local/share/mimocode/mimocode.db");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS session(id TEXT PRIMARY KEY, directory TEXT, version TEXT, time_created INTEGER); CREATE TABLE IF NOT EXISTS message(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL); DELETE FROM message; DELETE FROM session;").unwrap();
+    let sid = if desktop {
+        "desktop-session"
+    } else {
+        "cli-session"
+    };
+    conn.execute(
+        "INSERT INTO session VALUES (?1,'/fixture',?2,1772400000000)",
+        rusqlite::params![sid, if desktop { "desktop-test" } else { "1.2.3" }],
+    )
+    .unwrap();
+    let mut data = serde_json::json!({"role":"assistant","modelID":"fixture-model","providerID":"mimo","cost":input as f64/100.0,"tokens":{"input":input,"output":0,"cache":{"read":0,"write":0}},"time":{"created":1772474400000i64}});
+    if explicit {
+        data["id"] = "shared-response".into();
+    }
+    conn.execute(
+        "INSERT INTO message VALUES ('row',?1,?2)",
+        rusqlite::params![sid, data.to_string()],
+    )
+    .unwrap();
+    conn.close().unwrap();
+    path
+}
+
+#[test]
+fn test_graph_source_snapshots_mimo_shared_store_transfer_lower_zero_and_partial_selection() {
+    let tmp = source_snapshot_fixture();
+    let clients = ["--client", "micode,micode-desktop"];
+    let mut id = None;
+    let mut scope_id = None;
+    for (desktop, input) in [(false, 15), (true, 15), (true, 5), (true, 0)] {
+        write_snapshot_mimo(tmp.path(), desktop, input, true);
+        // Warm normal cache remains diagnostic input, never completeness proof.
+        assert_eq!(
+            native_graph(tmp.path(), "micode,micode-desktop")["summary"]["totalTokens"],
+            input
+        );
+        let graph = snapshot_export(tmp.path(), &clients);
+        assert_eq!(only_scope(&graph)["readStatus"], "complete");
+        assert_eq!(only_scope(&graph)["identityStatus"], "exact");
+        assert_eq!(source_tokens(&graph["sourceUsage"]), input);
+        let session = &graph["sourceUsage"]["sessions"][0];
+        assert_eq!(
+            session["client"],
+            if desktop { "micode-desktop" } else { "micode" }
+        );
+        let event = &session["events"][0];
+        if let Some(id) = &id {
+            assert_eq!(&event["id"], id);
+        } else {
+            id = Some(event["id"].clone());
+        }
+        if let Some(id) = &scope_id {
+            assert_eq!(&session["scopeId"], id);
+        } else {
+            scope_id = Some(session["scopeId"].clone());
+        }
+        assert_eq!(
+            graph["contributions"],
+            native_graph(tmp.path(), "micode,micode-desktop")["contributions"]
+        );
+    }
+    for client in ["micode", "micode-desktop"] {
+        let graph = snapshot_export(tmp.path(), &["--client", client]);
+        assert_eq!(only_scope(&graph)["readStatus"], "partial");
+        assert_eq!(
+            only_scope(&graph)["clients"],
+            serde_json::json!(["micode", "micode-desktop"])
+        );
+        assert_eq!(
+            graph["sourceUsage"]["partialClients"],
+            serde_json::json!(["micode", "micode-desktop"])
+        );
+    }
+    let path = write_snapshot_mimo(tmp.path(), false, 15, false);
+    let unresolved = snapshot_export(tmp.path(), &clients);
+    assert_eq!(only_scope(&unresolved)["identityStatus"], "unresolved");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("DELETE FROM message; INSERT INTO session VALUES ('empty-desktop','/fixture','desktop-test',1772400000000);").unwrap();
+    conn.close().unwrap();
+    let empty = snapshot_export(tmp.path(), &clients);
+    assert_eq!(only_scope(&empty)["readStatus"], "complete");
+    assert_eq!(only_scope(&empty)["identityStatus"], "exact");
+    assert_eq!(
+        empty["sourceUsage"]["sessions"].as_array().unwrap().len(),
+        2
+    );
+    assert!(source_events(&empty["sourceUsage"]).next().is_none());
+}
+
+#[test]
+fn test_graph_source_snapshots_mimo_known_failures_and_different_key_equivalence() {
+    let tmp = source_snapshot_fixture();
+    let clients = ["--client", "micode,micode-desktop"];
+    let path = write_snapshot_mimo(tmp.path(), false, 15, true);
+    let warm = native_graph(tmp.path(), "micode,micode-desktop");
+    assert_eq!(warm["summary"]["totalTokens"], 15);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let data: String = conn
+        .query_row("SELECT data FROM message", [], |row| row.get(0))
+        .unwrap();
+    let mut copied: serde_json::Value = serde_json::from_str(&data).unwrap();
+    copied["id"] = "different-id".into();
+    conn.execute(
+        "INSERT INTO message VALUES ('copy','cli-session',?1)",
+        [copied.to_string()],
+    )
+    .unwrap();
+    conn.close().unwrap();
+    let aliases = snapshot_export(tmp.path(), &clients);
+    assert_eq!(aliases["summary"]["totalTokens"], 15);
+    assert_eq!(only_scope(&aliases)["identityStatus"], "unresolved");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE message SET data='{malformed-json' WHERE id='row'",
+        [],
+    )
+    .unwrap();
+    conn.close().unwrap();
+    let partial = snapshot_export(tmp.path(), &clients);
+    assert_eq!(only_scope(&partial)["readStatus"], "partial");
+    fs::remove_file(&path).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.close().unwrap();
+    let wrong_schema = snapshot_export(tmp.path(), &clients);
+    assert_eq!(only_scope(&wrong_schema)["readStatus"], "partial");
+    fs::write(&path, b"not a SQLite store").unwrap();
+    let corrupt = snapshot_export(tmp.path(), &clients);
+    assert_eq!(only_scope(&corrupt)["readStatus"], "partial");
+    assert!(source_events(&corrupt["sourceUsage"]).next().is_none());
+}
+
+#[test]
+fn test_graph_source_snapshots_mimo_invalid_accounting_after_warm_native_cache() {
+    let tmp = source_snapshot_fixture();
+    let clients = ["--client", "micode,micode-desktop"];
+    let path = write_snapshot_mimo(tmp.path(), false, 45, true);
+    let accepted = snapshot_export(tmp.path(), &clients);
+    let id = source_events(&accepted["sourceUsage"]).next().unwrap()["id"].clone();
+    assert_eq!(only_scope(&accepted)["readStatus"], "complete");
+    for _ in 0..2 {
+        assert_eq!(
+            native_graph(tmp.path(), "micode,micode-desktop")["summary"]["totalTokens"],
+            45
+        );
+    }
+    let invalid: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/source-snapshot-mimo-invalid-accounting.json"
+    ))
+    .unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("UPDATE message SET data=?1", [invalid.to_string()])
+        .unwrap();
+    conn.close().unwrap();
+    for _ in 0..2 {
+        let native = native_graph(tmp.path(), "micode,micode-desktop");
+        assert_eq!(native["summary"]["totalTokens"], 15);
+        assert_eq!(native["summary"]["totalCost"], 0.15);
+        let partial = snapshot_export(tmp.path(), &clients);
+        assert_eq!(only_scope(&partial)["readStatus"], "partial");
+        assert_eq!(only_scope(&partial)["identityStatus"], "exact");
+        assert_eq!(source_tokens(&partial["sourceUsage"]), 15);
+        assert_eq!(
+            source_events(&partial["sourceUsage"]).next().unwrap()["id"],
+            id
+        );
+        assert_eq!(partial["contributions"], native["contributions"]);
+    }
+    let mut valid = invalid.clone();
+    valid["tokens"]["input"] = 0.into();
+    for (pointer, value) in [
+        ("/tokens/cache/read", serde_json::json!(-1)),
+        ("/tokens/cache/write", serde_json::json!("bad")),
+        ("/tokens/reasoning", serde_json::json!(-1)),
+        ("/tokens/output", serde_json::json!(1.5)),
+        ("/tokens/cache", serde_json::json!({"read_tokens":30})),
+        ("/tokens/cache", serde_json::json!([])),
+        ("/tokens", serde_json::json!([0, 15, null, null])),
+        ("/tokens/prompt_tokens", serde_json::json!(30)),
+        ("/tokens/total", serde_json::json!(45)),
+        ("/usage", serde_json::json!({"input_tokens":45})),
+        ("/cost", serde_json::json!(-0.15)),
+        ("/cost", serde_json::json!("bad")),
+    ] {
+        let mut data = valid.clone();
+        let (parent, key) = pointer.rsplit_once('/').unwrap();
+        data.pointer_mut(parent)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(key.into(), value);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("UPDATE message SET data=?1", [data.to_string()])
+            .unwrap();
+        conn.close().unwrap();
+        let cold = native_graph(tmp.path(), "micode,micode-desktop");
+        let warm = native_graph(tmp.path(), "micode,micode-desktop");
+        assert_eq!(cold["contributions"], warm["contributions"]);
+        let partial = snapshot_export(tmp.path(), &clients);
+        assert_eq!(only_scope(&partial)["readStatus"], "partial", "{data}");
+        assert_eq!(partial["contributions"], warm["contributions"], "{data}");
+    }
+    write_snapshot_mimo(tmp.path(), true, 15, true);
+    let corrected = snapshot_export(tmp.path(), &clients);
+    assert_eq!(only_scope(&corrected)["readStatus"], "complete");
+    assert_eq!(only_scope(&corrected)["identityStatus"], "exact");
+    assert_eq!(source_tokens(&corrected["sourceUsage"]), 15);
+    assert_eq!(
+        source_events(&corrected["sourceUsage"]).next().unwrap()["id"],
+        id
+    );
+    write_snapshot_mimo(tmp.path(), true, 0, true);
+    let zero = snapshot_export(tmp.path(), &clients);
+    assert_eq!(only_scope(&zero)["readStatus"], "complete");
+    assert_eq!(source_tokens(&zero["sourceUsage"]), 0);
+}
+
+#[test]
+fn test_graph_source_snapshots_missing_explicit_root_and_incomplete_mimo_assistant_fail_closed() {
+    let tmp = source_snapshot_fixture();
+    let path = write_snapshot_mimo(tmp.path(), false, 15, true);
+    let clients = ["--client", "micode,micode-desktop"];
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("UPDATE message SET data=?1", [r#"{"role":"assistant"}"#])
+        .unwrap();
+    conn.close().unwrap();
+    let incomplete = snapshot_export(tmp.path(), &clients);
+    assert_eq!(only_scope(&incomplete)["readStatus"], "partial");
+    write_snapshot_mimo(tmp.path(), false, 15, true);
+    fs::write(settings_json_path(tmp.path()), serde_json::json!({"scanner":{"bucketTimezone":"Etc/UTC","extraScanPaths":{"micode-desktop":[tmp.path().join("missing-store.db")]}}}).to_string()).unwrap();
+    let missing = snapshot_export(tmp.path(), &clients);
+    assert_eq!(source_tokens(&missing["sourceUsage"]), 15);
+    assert_eq!(only_scope(&missing)["readStatus"], "partial");
+    codex_snapshot_fixture(tmp.path(), 15, false, true);
+    fs::write(settings_json_path(tmp.path()), serde_json::json!({"scanner":{"bucketTimezone":"Etc/UTC","extraScanPaths":{"codex":[tmp.path().join("missing-rollouts")]}}}).to_string()).unwrap();
+    let missing = snapshot_export(tmp.path(), &["--client", "codex"]);
+    assert_eq!(source_tokens(&missing["sourceUsage"]), 15);
+    assert_eq!(only_scope(&missing)["readStatus"], "partial");
 }
 
 #[test]
@@ -8318,10 +8596,13 @@ fn test_graph_source_snapshots_native_antigravity_winner_migration_keeps_event_i
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0]["client"], client);
         assert_eq!(sessions[0]["sessionId"], session);
-        assert_eq!(sessions[0]["days"][0]["totals"]["tokens"], 6);
+        assert_eq!(
+            source_tokens(&serde_json::json!({"sessions": [sessions[0]]})),
+            6
+        );
         let events = sessions[0]["events"].as_array().unwrap();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["days"], sessions[0]["days"]);
+        assert!(events[0].get("days").is_none());
         if let Some(id) = &event_id {
             assert_eq!(&events[0]["id"], id);
         } else {
