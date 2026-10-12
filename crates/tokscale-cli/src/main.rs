@@ -2371,6 +2371,8 @@ fn run_models_report(
             reasoning: i64,
             message_count: i32,
             cost: f64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            unpriced_tokens: Option<i64>,
             performance: tokscale_core::ModelPerformance,
         }
 
@@ -2493,6 +2495,7 @@ fn run_models_report(
                     reasoning: e.reasoning,
                     message_count: e.message_count,
                     cost: e.cost,
+                    unpriced_tokens: e.unpriced_tokens,
                     performance: e.performance,
                 })
                 .collect(),
@@ -4898,6 +4901,8 @@ struct TsSourceContribution {
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_id: Option<String>,
     tokens: TsTokenBreakdown,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unpriced_tokens: Option<i64>,
     cost: f64,
     messages: i32,
 }
@@ -5078,6 +5083,7 @@ fn to_ts_daily_contribution(
                     cache_write: s.tokens.cache_write,
                     reasoning: s.tokens.reasoning,
                 },
+                unpriced_tokens: s.unpriced_tokens,
                 cost: s.cost,
                 messages: s.messages,
             })
@@ -7706,6 +7712,7 @@ mod tests {
     #[test]
     fn model_entry_total_tokens_saturates_a_single_entrys_buckets() {
         let entry = tokscale_core::ModelUsage {
+            unpriced_tokens: None,
             client: "antigravity-cli".to_string(),
             merged_clients: None,
             workspace_key: None,
@@ -7730,6 +7737,7 @@ mod tests {
         // model_entry_total_tokens already saturates each entry to i64::MAX;
         // folding two such entries with plain `.sum()` would still overflow.
         let make = || tokscale_core::ModelUsage {
+            unpriced_tokens: None,
             client: "antigravity-cli".to_string(),
             merged_clients: None,
             workspace_key: None,
@@ -7793,6 +7801,7 @@ mod tests {
             intensity: 0,
             token_breakdown: token_breakdown(total_tokens),
             clients: vec![ClientContribution {
+                unpriced_tokens: None,
                 client: client.to_string(),
                 model_id: model_id.to_string(),
                 provider_id: "openai".to_string(),
@@ -9212,6 +9221,7 @@ mod tests {
         messages: i32,
     ) -> ClientContribution {
         ClientContribution {
+            unpriced_tokens: None,
             client: client.to_string(),
             model_id: model_id.to_string(),
             provider_id: provider_id.to_string(),

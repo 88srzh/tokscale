@@ -488,6 +488,12 @@ pub struct ClientContribution {
     pub model_id: String,
     pub provider_id: String,
     pub tokens: TokenBreakdown,
+    #[serde(
+        default,
+        rename = "unpricedTokens",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unpriced_tokens: Option<i64>,
     pub cost: f64,
     pub messages: i32,
 }
@@ -627,6 +633,8 @@ pub struct ModelUsage {
     pub reasoning: i64,
     pub message_count: i32,
     pub cost: f64,
+    #[serde(rename = "unpricedTokens", skip_serializing_if = "Option::is_none")]
+    pub unpriced_tokens: Option<i64>,
     pub performance: ModelPerformance,
 }
 
@@ -4730,17 +4738,18 @@ fn aggregate_model_usage_entries_with_labeler(
     rollup: WorktreeRollup,
     labeler: &mut WorkspaceLabeler,
 ) -> Vec<ModelUsage> {
-    aggregate_model_usage_entries_with_source_performance(
-        messages, group_by, rollup, labeler, false,
+    aggregate_model_usage_entries_with_source_metadata(
+        messages, group_by, rollup, labeler, false, None,
     )
 }
 
-fn aggregate_model_usage_entries_with_source_performance(
+fn aggregate_model_usage_entries_with_source_metadata(
     messages: Vec<UnifiedMessage>,
     group_by: &GroupBy,
     rollup: WorktreeRollup,
     labeler: &mut WorkspaceLabeler,
-    include_timed_output: bool,
+    include_source_metadata: bool,
+    pricing: Option<&pricing::PricingService>,
 ) -> Vec<ModelUsage> {
     let mut model_map: HashMap<String, ModelUsage> = HashMap::new();
 
@@ -4820,8 +4829,9 @@ fn aggregate_model_usage_entries_with_source_performance(
             reasoning: 0,
             message_count: 0,
             cost: 0.0,
+            unpriced_tokens: include_source_metadata.then_some(0),
             performance: ModelPerformance {
-                timed_output_tokens: include_timed_output.then_some(0),
+                timed_output_tokens: include_source_metadata.then_some(0),
                 ..Default::default()
             },
         });
@@ -4854,6 +4864,11 @@ fn aggregate_model_usage_entries_with_source_performance(
         entry.message_count += msg.message_count.max(0);
         entry.cost += msg.cost;
         let token_total = positive_token_total(&msg.tokens);
+        if let Some(unpriced_tokens) = &mut entry.unpriced_tokens {
+            if message_has_unpriced_usage(&msg, pricing) {
+                *unpriced_tokens = unpriced_tokens.saturating_add(token_total);
+            }
+        }
         entry
             .performance
             .record_message(token_total, msg.duration_ms);
@@ -4909,6 +4924,23 @@ fn positive_token_total(tokens: &TokenBreakdown) -> i64 {
         .saturating_add(tokens.cache_read.max(0))
         .saturating_add(tokens.cache_write.max(0))
         .saturating_add(tokens.reasoning.max(0))
+}
+
+/// Coverage classification shared by event proof and opt-in report counters.
+/// A fallback cost (even nonzero) does not establish native pricing coverage.
+fn message_has_unpriced_usage(
+    message: &UnifiedMessage,
+    pricing: Option<&pricing::PricingService>,
+) -> bool {
+    positive_token_total(&message.tokens) > 0
+        && !message.has_authoritative_cost()
+        && pricing.is_none_or(|pricing| {
+            !pricing.covers_usage_with_provider(
+                &message.model_id,
+                Some(&message.provider_id),
+                &message.tokens,
+            )
+        })
 }
 
 /// Sum the (input, output, cache_read, cache_write) token fields across model
@@ -5011,12 +5043,13 @@ async fn get_model_report_with_source_mode(
     };
     let mut labeler = WorkspaceLabeler::default();
     let entries = if source_snapshots {
-        aggregate_model_usage_entries_with_source_performance(
+        aggregate_model_usage_entries_with_source_metadata(
             filtered,
             &options.group_by,
             options.worktree_rollup,
             &mut labeler,
             true,
+            pricing.as_deref(),
         )
     } else {
         aggregate_model_usage_entries_with_labeler(
@@ -5650,8 +5683,8 @@ impl<'a> GraphSink<'a> {
                 .entry(source_dedup_domain(&message.client).into())
                 .or_default();
             scope.clients.insert(message.client.clone());
-            scope.unresolved_rows |= source_event_id(&message).is_none()
-                || !has_source_session_identity(&message)
+            scope.unresolved_rows |= source_event_id(message).is_none()
+                || !has_source_session_identity(message)
                 || message.timestamp <= 0;
         }
         if let (Some(source_usage), Some(sessions)) =
@@ -5665,7 +5698,7 @@ impl<'a> GraphSink<'a> {
                 source_usage.partial_clients.push(message.client.clone());
                 source_usage.partial_clients.sort();
             }
-            if !has_source_session_identity(&message) {
+            if !has_source_session_identity(message) {
                 let rows = source_usage
                     .rows_without_identity
                     .entry(message.client.clone())
@@ -5719,7 +5752,11 @@ impl<'a> GraphSink<'a> {
         };
 
         for message in &batch {
-            self.daily.add(message);
+            if self.source_usage.is_some() {
+                self.daily.add_with_source_pricing(message, self.pricing);
+            } else {
+                self.daily.add(message);
+            }
             self.add_source_contribution(message);
             if message.timestamp > 0 {
                 self.spans.push(sessionize::SessionSpan::from_message(
