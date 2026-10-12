@@ -51,9 +51,6 @@ const CACHE_FORMAT_VERSION: u32 = 10;
 // version moves too because those entries also serialize UnifiedMessage, so
 // it stays one ahead of CACHE_FORMAT_VERSION as both move together.
 const MICODE_CACHE_FORMAT_VERSION: u32 = 11;
-// Only Codex carries export group keys. The ordinary UnifiedMessage bincode
-// layout stays unchanged; legacy Codex envelopes reparse for this metadata.
-const CODEX_CACHE_FORMAT_VERSION: u32 = 12;
 const LEGACY_CACHE_FORMAT_VERSION_V4: u32 = 4;
 const LEGACY_CACHE_FORMAT_VERSION_V5: u32 = 5;
 const LEGACY_CACHE_FORMAT_VERSION_V6: u32 = 6;
@@ -3135,34 +3132,6 @@ fn read_shard_with_limit(
         return ShardReadStatus::Stale;
     }
 
-    if identity.namespace == ClientId::Codex.as_str() {
-        if envelope.format_version != CODEX_CACHE_FORMAT_VERSION {
-            return ShardReadStatus::Stale;
-        }
-        type CodexWireEntry = (CachedSourceEntry, Vec<Option<String>>);
-        return match bincode::options()
-            .with_limit(max_shard_bytes)
-            .deserialize::<Vec<CodexWireEntry>>(&envelope.payload)
-        {
-            Ok(entries) => {
-                let mut restored = Vec::with_capacity(entries.len());
-                for (mut entry, groups) in entries {
-                    if groups.len() != entry.messages.len() {
-                        return ShardReadStatus::Invalid(
-                            "Codex source group metadata length mismatch".into(),
-                        );
-                    }
-                    for (message, group) in entry.messages.iter_mut().zip(groups) {
-                        message.source_group_key = group;
-                    }
-                    restored.push(entry);
-                }
-                ShardReadStatus::Loaded(restored)
-            }
-            Err(error) => ShardReadStatus::Invalid(error.to_string()),
-        };
-    }
-
     if envelope.format_version == MICODE_CACHE_FORMAT_VERSION {
         if identity.namespace != ClientId::MiMoCode.as_str() {
             return ShardReadStatus::Stale;
@@ -3357,25 +3326,7 @@ fn write_shard_with_limit(
     max_shard_bytes: u64,
 ) -> std::io::Result<()> {
     let is_micode = identity.namespace == ClientId::MiMoCode.as_str();
-    let is_codex = identity.namespace == ClientId::Codex.as_str();
-    let payload = if is_codex {
-        let entries: Vec<_> = entries
-            .iter()
-            .map(|entry| {
-                (
-                    entry,
-                    entry
-                        .messages
-                        .iter()
-                        .map(|message| &message.source_group_key)
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .collect();
-        bincode::options()
-            .with_limit(max_shard_bytes)
-            .serialize(&entries)
-    } else if is_micode {
+    let payload = if is_micode {
         let entries: Vec<_> = entries
             .iter()
             .map(|entry| (entry, &entry.micode_metadata))
@@ -3390,9 +3341,7 @@ fn write_shard_with_limit(
     }
     .map_err(std::io::Error::other)?;
     let envelope = CachedShardEnvelope {
-        format_version: if is_codex {
-            CODEX_CACHE_FORMAT_VERSION
-        } else if is_micode {
+        format_version: if is_micode {
             MICODE_CACHE_FORMAT_VERSION
         } else {
             CACHE_FORMAT_VERSION
@@ -8938,40 +8887,42 @@ mod tests {
             "inside the verbatim namespace `/` is part of the name, not a separator"
         );
     }
+
     #[test]
-    fn codex_source_groups_survive_disk_cache_and_legacy_is_not_promoted() {
+    fn codex_cache_keeps_shared_layout_and_existing_parser_version() {
         let source = write_temp_file(b"codex source\n");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("codex.bin");
         let identity = CacheIdentity::for_client(ClientId::Codex);
+        assert_eq!(identity.parser_version, 12);
+        assert_eq!(CACHE_FORMAT_VERSION, 10);
+        assert_eq!(MICODE_CACHE_FORMAT_VERSION, 11);
         let mut entry = test_entry(identity, source.path(), "owner-A");
-        let before = bincode::options().serialize(&entry.messages).unwrap();
+        let ordinary_payload = bincode::options().serialize(&vec![entry.clone()]).unwrap();
         entry.messages[0].source_group_key =
             Some(crate::source_snapshot::codex_group_key("upstream", "turn"));
-        // serde-skipped export metadata cannot alter other clients' layouts.
-        assert_eq!(
-            before,
-            bincode::options().serialize(&entry.messages).unwrap()
-        );
         write_shard_with_limit(&path, identity, &[entry.clone()], MAX_CACHE_SHARD_BYTES).unwrap();
-        match read_shard(&path, identity) {
-            ShardReadStatus::Loaded(entries) => assert_eq!(
-                entries[0].messages[0].source_group_key,
-                entry.messages[0].source_group_key
-            ),
-            _ => panic!("Codex group sidecar must roundtrip"),
-        }
-        let legacy = CachedShardEnvelope {
-            format_version: CACHE_FORMAT_VERSION,
-            parser_namespace: identity.namespace.into(),
-            parser_version: identity.parser_version,
-            payload: bincode::options().serialize(&vec![entry]).unwrap(),
+        let envelope: CachedShardEnvelope = bincode::options()
+            .deserialize(&std::fs::read(&path).unwrap())
+            .unwrap();
+        assert_eq!(envelope.format_version, 10);
+        assert_eq!(envelope.parser_version, 12);
+        assert_eq!(envelope.payload, ordinary_payload);
+        let ShardReadStatus::Loaded(entries) = read_shard(&path, identity) else {
+            panic!("ordinary Codex cache must load without a sidecar or reparse");
         };
-        let bytes = bincode::options().serialize(&legacy).unwrap();
-        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].messages[0].tokens, entry.messages[0].tokens);
+        assert!(entries[0].messages[0].source_group_key.is_none());
+        // A base-format envelope remains a warm input after this change.
+        let base = CachedShardEnvelope {
+            payload: ordinary_payload,
+            ..envelope
+        };
+        std::fs::write(&path, bincode::options().serialize(&base).unwrap()).unwrap();
         assert!(matches!(
             read_shard(&path, identity),
-            ShardReadStatus::Stale
+            ShardReadStatus::Loaded(_)
         ));
     }
 }

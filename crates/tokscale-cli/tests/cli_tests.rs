@@ -7838,7 +7838,7 @@ fn test_graph_source_snapshots_codex_complete45_partial15_complete15_cache_and_e
     let old_event = source_events(&old["sourceUsage"]).next().unwrap();
     assert_eq!(old_event["contributions"].as_array().unwrap().len(), 2);
     let id = old_event["id"].clone();
-    // A separate normal cache scan retains group metadata during incremental append.
+    // Native incremental caches carry no export groups; export reads them afresh.
     let full = fs::read_to_string(&path).unwrap();
     let prefix = full.lines().take(3).collect::<Vec<_>>().join("\n") + "\n";
     fs::write(&path, &prefix).unwrap();
@@ -7924,6 +7924,49 @@ fn test_graph_source_snapshots_codex_complete45_partial15_complete15_cache_and_e
         .as_array()
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn test_graph_source_snapshots_codex_owner_a100_to_b20_has_stable_transient_turn() {
+    let tmp = source_snapshot_fixture();
+    let path = codex_snapshot_fixture(tmp.path(), 100, false, true);
+    for _ in 0..2 {
+        assert_eq!(
+            native_graph(tmp.path(), "codex")["summary"]["totalTokens"],
+            100
+        );
+    }
+    let old = snapshot_export(tmp.path(), &["--client", "codex"]);
+    let id = source_events(&old["sourceUsage"]).next().unwrap()["id"].clone();
+    assert_eq!(source_tokens(&old["sourceUsage"]), 100);
+    assert_eq!(only_scope(&old)["readStatus"], "complete");
+    assert_eq!(only_scope(&old)["identityStatus"], "exact");
+    codex_snapshot_fixture(tmp.path(), 20, false, true);
+    let moved = path
+        .with_file_name("rollout-2026-03-02T00-00-00-01900000-0000-7000-8000-000000000002.jsonl");
+    fs::rename(&path, &moved).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            native_graph(tmp.path(), "codex")["summary"]["totalTokens"],
+            20
+        );
+        let corrected = snapshot_export(tmp.path(), &["--client", "codex"]);
+        assert_ne!(
+            corrected["sourceUsage"]["sessions"][0]["sessionId"],
+            old["sourceUsage"]["sessions"][0]["sessionId"]
+        );
+        assert_eq!(source_tokens(&corrected["sourceUsage"]), 20);
+        assert_eq!(only_scope(&corrected)["readStatus"], "complete");
+        assert_eq!(only_scope(&corrected)["identityStatus"], "exact");
+        assert_eq!(
+            source_events(&corrected["sourceUsage"]).next().unwrap()["id"],
+            id
+        );
+        assert_eq!(
+            corrected["contributions"],
+            native_graph(tmp.path(), "codex")["contributions"]
+        );
+    }
 }
 
 #[test]
@@ -8081,6 +8124,34 @@ fn test_graph_source_snapshots_mimo_shared_store_transfer_lower_zero_and_partial
             graph["contributions"],
             native_graph(tmp.path(), "micode,micode-desktop")["contributions"]
         );
+        if !desktop {
+            // Both surfaces replay the same embedded response. Normal and
+            // source scans must choose one owner without minting a new ID.
+            let path = tmp.path().join(".local/share/mimocode/mimocode.db");
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("INSERT INTO session VALUES ('desktop-copy','/fixture','desktop-test',1772474401000); INSERT INTO message SELECT 'copy','desktop-copy',data FROM message WHERE id='row';").unwrap();
+            conn.close().unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    native_graph(tmp.path(), "micode,micode-desktop")["summary"]["totalTokens"],
+                    input
+                );
+                let shared = snapshot_export(tmp.path(), &clients);
+                assert_eq!(only_scope(&shared)["readStatus"], "complete");
+                assert_eq!(only_scope(&shared)["identityStatus"], "exact");
+                assert_eq!(source_tokens(&shared["sourceUsage"]), input);
+                assert_eq!(source_events(&shared["sourceUsage"]).count(), 1);
+                assert_eq!(
+                    source_events(&shared["sourceUsage"]).next().unwrap()["id"],
+                    event["id"]
+                );
+                assert_eq!(shared["sourceUsage"]["sessions"][0]["client"], "micode");
+                assert!(shared["sourceUsage"]["sessions"][1]["events"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty());
+            }
+        }
     }
     for client in ["micode", "micode-desktop"] {
         let graph = snapshot_export(tmp.path(), &["--client", client]);

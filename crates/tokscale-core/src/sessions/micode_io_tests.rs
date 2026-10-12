@@ -367,109 +367,142 @@ async fn micode_metadata_read_failure_stays_cold_until_successfully_repaired() {
 
 #[tokio::test]
 #[serial_test::serial]
-async fn micode_invalid_accounting_invalidates_warm_cache_until_repaired() {
-    use crate::message_cache::{
-        CacheIdentity, CachedSourceEntry, SourceFingerprint, SourceMessageCache,
-    };
+async fn micode_lenient_invalid_accounting_stays_warm_and_export_remains_partial() {
+    use crate::message_cache::{CacheIdentity, SourceMessageCache};
     let home = tempfile::tempdir().unwrap();
     let cache = tempfile::tempdir().unwrap();
     let _env = cache_env(cache.path());
     let path = fixture(home.path());
-    parse_local_unified_messages_with_pricing(options(home.path()), None)
-        .await
-        .unwrap();
-    reset();
-    parse_local_unified_messages_with_pricing(options(home.path()), None)
-        .await
-        .unwrap();
-    assert_eq!(counts(), IoCounts::default());
     let conn = Connection::open(&path).unwrap();
-    conn.execute(
-        "UPDATE message SET data=json_set(data,'$.tokens.input',-30,'$.tokens.output',15)",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-    assert!(!parse_micode_source(&path).complete);
-    for _ in 0..2 {
-        reset();
-        let native = parse_local_unified_messages_with_pricing(options(home.path()), None)
-            .await
-            .unwrap();
-        assert_eq!(native.iter().map(|m| m.tokens.total()).sum::<i64>(), 30);
-        assert_single_read(2);
-        assert!(
-            SourceMessageCache::load()
-                .take(CacheIdentity::for_client(crate::ClientId::MiMoCode), &path)
-                .is_none(),
-            "partial rows cannot acquire a complete cache payload"
-        );
-    }
-    // Simulate a pre-fix envelope that admitted these byte-identical clamped
-    // rows. Native cache hits remain compatible, but export must re-read them.
-    let source = parse_micode_source(&path);
-    let entry = CachedSourceEntry::new(
-        CacheIdentity::for_client(crate::ClientId::MiMoCode),
-        &path,
-        SourceFingerprint::from_sqlite_path(&path).unwrap(),
-        source.messages,
-        Vec::new(),
-        None,
-    )
-    .with_micode_metadata(source.metadata);
-    let mut stored = SourceMessageCache::load();
-    stored.insert(entry);
-    stored.save_if_dirty();
-    reset();
-    let warm = parse_local_unified_messages_with_pricing(options(home.path()), None)
-        .await
+    let original: String = conn
+        .query_row("SELECT data FROM message WHERE id='a'", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(warm.iter().map(|m| m.tokens.total()).sum::<i64>(), 30);
-    assert_eq!(counts(), IoCounts::default());
-    reset();
-    let report = crate::generate_graph_with_loaded_pricing(
-        crate::ReportOptions {
-            home_dir: options(home.path()).home_dir,
-            clients: options(home.path()).clients,
-            scanner_settings: crate::scanner::ScannerSettings {
-                bucket_timezone: Some("Etc/UTC".into()),
-                ..Default::default()
-            },
+    let original: serde_json::Value = serde_json::from_str(&original).unwrap();
+    let report_options = || crate::ReportOptions {
+        home_dir: options(home.path()).home_dir,
+        clients: options(home.path()).clients,
+        scanner_settings: crate::scanner::ScannerSettings {
+            bucket_timezone: Some("Etc/UTC".into()),
             ..Default::default()
         },
+        ..Default::default()
+    };
+    // One healthy sibling keeps the ordinary cache useful even when the other
+    // row cannot be decoded. Missing/null accounting is skipped by native SQL.
+    for (pointer, value, rows, total, decodes) in [
+        ("/tokens/input", serde_json::json!(-30), 2, 140, 2),
+        ("/tokens/cache", serde_json::json!([]), 2, 240, 2),
+        (
+            "/tokens",
+            serde_json::json!([100, 20, null, null]),
+            2,
+            240,
+            2,
+        ),
+        ("/tokens/prompt_tokens", serde_json::json!(45), 2, 240, 2),
+        ("/cost", serde_json::json!(-0.15), 2, 240, 2),
+        ("/tokens/input", serde_json::json!("bad"), 1, 120, 2),
+        ("/tokens", serde_json::Value::Null, 1, 120, 1),
+    ] {
+        let mut data = original.clone();
+        let (parent, key) = pointer.rsplit_once('/').unwrap();
+        data.pointer_mut(parent)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert(key.into(), value);
+        conn.execute(
+            "UPDATE message SET data=?1 WHERE id='a'",
+            [data.to_string()],
+        )
+        .unwrap();
+        assert!(
+            parse_micode_source(&path).complete,
+            "ordinary tolerance: {data}"
+        );
+        assert!(
+            !parse_micode_source_for_export(&path).complete,
+            "strict opt-in: {data}"
+        );
+        reset();
+        let cold = parse_local_unified_messages_with_pricing(options(home.path()), None)
+            .await
+            .unwrap();
+        assert_single_read(decodes);
+        assert_eq!(cold.len(), rows, "{data}");
+        assert_eq!(
+            cold.iter().map(|m| m.tokens.total()).sum::<i64>(),
+            total,
+            "{data}"
+        );
+        let identity = CacheIdentity::for_client(crate::ClientId::MiMoCode);
+        let cached = SourceMessageCache::load()
+            .take(identity, &path)
+            .expect("ordinary compatible rows remain cacheable");
+        assert!(cached.has_valid_micode_metadata());
+        for _ in 0..2 {
+            reset();
+            let warm = parse_local_unified_messages_with_pricing(options(home.path()), None)
+                .await
+                .unwrap();
+            assert_eq!(counts(), IoCounts::default(), "warm ordinary scan: {data}");
+            assert_eq!(
+                serde_json::to_value(&warm).unwrap(),
+                serde_json::to_value(&cold).unwrap()
+            );
+            reset();
+            let graph = crate::generate_graph_with_loaded_pricing(
+                report_options(),
+                None,
+                crate::GraphPricingRequirement::LenientSourceSnapshots,
+            )
+            .await
+            .unwrap();
+            assert_single_read(2);
+            let usage = serde_json::to_value(graph.source_usage.unwrap()).unwrap();
+            assert_eq!(usage["scopes"][0]["readStatus"], "partial", "{data}");
+            assert_eq!(usage["scopes"][0]["identityStatus"], "exact", "{data}");
+            let after = SourceMessageCache::load().take(identity, &path).unwrap();
+            assert_eq!(
+                bincode::serialize(&after).unwrap(),
+                bincode::serialize(&cached).unwrap(),
+                "export must leave native cache intact"
+            );
+        }
+    }
+    // Repair and correct downward while moving the same response to the CLI.
+    let mut corrected = original;
+    corrected["tokens"]["input"] = 0.into();
+    corrected["tokens"]["output"] = 15.into();
+    conn.execute(
+        "UPDATE message SET data=?1 WHERE id='a'",
+        [corrected.to_string()],
+    )
+    .unwrap();
+    conn.execute("UPDATE session SET version='1.0.0'", [])
+        .unwrap();
+    reset();
+    let repaired = parse_local_unified_messages_with_pricing(options(home.path()), None)
+        .await
+        .unwrap();
+    assert_single_read(2);
+    assert!(repaired.iter().all(|m| m.client == "micode"));
+    assert_eq!(repaired.iter().map(|m| m.tokens.total()).sum::<i64>(), 135);
+    let graph = crate::generate_graph_with_loaded_pricing(
+        report_options(),
         None,
         crate::GraphPricingRequirement::LenientSourceSnapshots,
     )
     .await
     .unwrap();
-    assert_single_read(2);
-    assert_eq!(
-        serde_json::to_value(report.source_usage.unwrap()).unwrap()["scopes"][0]["readStatus"],
-        "partial",
-        "a pre-fix warm envelope cannot supply source-read authority"
-    );
-    let conn = Connection::open(&path).unwrap();
-    conn.execute(
-        "UPDATE message SET data=json_set(data,'$.tokens.input',0)",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-    assert!(parse_micode_source(&path).complete);
+    let usage = serde_json::to_value(graph.source_usage.unwrap()).unwrap();
+    assert_eq!(usage["scopes"][0]["readStatus"], "complete");
+    assert_eq!(usage["scopes"][0]["identityStatus"], "exact");
     reset();
     parse_local_unified_messages_with_pricing(options(home.path()), None)
         .await
         .unwrap();
-    assert_single_read(2);
-    reset();
-    parse_local_unified_messages_with_pricing(options(home.path()), None)
-        .await
-        .unwrap();
-    assert_eq!(
-        counts(),
-        IoCounts::default(),
-        "a valid repaired source should become warm again"
-    );
+    assert_eq!(counts(), IoCounts::default());
 }
 
 #[tokio::test]
