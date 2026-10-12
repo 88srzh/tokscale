@@ -45,6 +45,13 @@ struct Cli {
     #[arg(long, help = "Output as JSON")]
     json: bool,
 
+    #[arg(
+        long,
+        requires = "json",
+        help = "Include source-only event evidence in the native JSON period report"
+    )]
+    source_snapshots: bool,
+
     #[arg(long, help = "Use legacy CLI table output")]
     light: bool,
 
@@ -111,6 +118,12 @@ enum Commands {
     Models {
         #[arg(long)]
         json: bool,
+        #[arg(
+            long,
+            requires = "json",
+            help = "Include source-only event evidence in this JSON report"
+        )]
+        source_snapshots: bool,
         #[arg(long)]
         light: bool,
         #[command(flatten)]
@@ -665,6 +678,7 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Models {
             json,
+            source_snapshots,
             light,
             clients,
             date,
@@ -686,6 +700,7 @@ fn main() -> Result<()> {
             if json || light || hide_zero || !can_use_tui {
                 run_models_report(
                     json,
+                    source_snapshots,
                     cli.home.clone(),
                     clients,
                     &date,
@@ -1027,6 +1042,7 @@ fn main() -> Result<()> {
             if cli.json {
                 run_models_report(
                     cli.json,
+                    cli.source_snapshots,
                     cli.home.clone(),
                     clients,
                     &cli.date,
@@ -1040,6 +1056,7 @@ fn main() -> Result<()> {
                 )
             } else if cli.light || cli.hide_zero || !can_use_tui {
                 run_models_report(
+                    false,
                     false,
                     cli.home.clone(),
                     clients,
@@ -2252,6 +2269,7 @@ fn worktree_rollup_from_flag(merge_worktrees: bool) -> tokscale_core::WorktreeRo
 #[allow(clippy::too_many_arguments)]
 fn run_models_report(
     json: bool,
+    source_snapshots: bool,
     home_dir: Option<String>,
     clients: Option<Vec<String>>,
     date: &DateRangeFlags,
@@ -2275,8 +2293,12 @@ fn run_models_report(
     let rt = Runtime::new()?;
     let report = rt
         .block_on(async {
-            get_model_report(context.report_options_with_rollup(group_by.clone(), worktree_rollup))
-                .await
+            let options = context.report_options_with_rollup(group_by.clone(), worktree_rollup);
+            if source_snapshots {
+                tokscale_core::get_source_snapshot_model_report(options).await
+            } else {
+                get_model_report(options).await
+            }
         })
         .map_err(|e| anyhow::anyhow!(e))?;
     let mut report = report;
@@ -2370,6 +2392,8 @@ fn run_models_report(
         #[derive(serde::Serialize)]
         #[serde(rename_all = "camelCase")]
         struct ModelReportJson {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            source_usage: Option<tokscale_core::SourceUsage>,
             group_by: String,
             entries: Vec<ModelUsageJson>,
             /// Per-session facts for session-grouped reports, joined by
@@ -2415,6 +2439,7 @@ fn run_models_report(
             })
             .collect();
         let output = ModelReportJson {
+            source_usage: report.source_usage,
             group_by: group_by.to_string(),
             sessions,
             workspaces,
@@ -7817,6 +7842,8 @@ mod tests {
             partial_clients: Vec::new(),
             bucket_timezone: "Etc/UTC".into(),
             day_key: "2026-03-02".into(),
+            scan_roots: Default::default(),
+            root_usage: Vec::new(),
             scopes: Vec::new(),
             rows_without_identity: Default::default(),
             sessions: vec![tokscale_core::SourceSessionUsage {
@@ -7825,6 +7852,7 @@ mod tests {
                 scope_id: "sha256:scope".into(),
                 events: vec![tokscale_core::SourceEventUsage {
                     id: Some("sha256:event".into()),
+                    observation_kind: "native",
                     contributions: vec![tokscale_core::SourceContribution {
                         timestamp: 1772409600000,
                         model_id: "model".into(),
@@ -7832,6 +7860,8 @@ mod tests {
                         tokens: Default::default(),
                         cost: 0.5,
                         messages: 1,
+                        pricing: None,
+                        performance: None,
                     }],
                 }],
             }],

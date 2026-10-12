@@ -53,6 +53,8 @@ fn snapshot(
         partial_clients: Vec::new(),
         bucket_timezone: "Etc/UTC".into(),
         day_key: "2026-03-03".into(),
+        scan_roots: Default::default(),
+        root_usage: Vec::new(),
         sessions: Vec::new(),
         scopes: Vec::new(),
         rows_without_identity: Default::default(),
@@ -424,4 +426,94 @@ fn source_snapshots_are_absent_without_opt_in() {
         .unwrap();
         assert!(graph.source_usage.is_none());
     }
+}
+
+#[test]
+fn source_snapshots_performance_and_unpriced_are_additive_native_token_buckets() {
+    let mut row = message(
+        "claude",
+        "session",
+        "2026-03-02",
+        "unpriced-model",
+        10,
+        Some("message:key"),
+    );
+    row.tokens.output = 5;
+    row.tokens.reasoning = 3;
+    row.tokens.cache_write = 4;
+    row.tokens.cache_write_1h = 2;
+    row.duration_ms = Some(1000);
+    let graph = snapshot(
+        &selected(&["claude"]),
+        vec![row.clone(), row],
+        Some(SourceReadEvidence::new("claude", true, true)),
+    );
+    let wire = serde_json::to_value(graph.source_usage.unwrap()).unwrap();
+    let c = &wire["sessions"][0]["events"][0]["contributions"][0];
+    assert_eq!(c["tokens"]["output"], 10);
+    assert_eq!(c["tokens"]["reasoning"], 6);
+    assert_eq!(c["tokens"]["cacheWrite"], 8);
+    assert_eq!(c["tokens"]["cacheWrite1h"], 4);
+    assert_eq!(c["pricing"]["unpricedTokens"], 44);
+    assert_eq!(c["pricing"]["unpricedMessages"], 2);
+    assert_eq!(c["performance"]["timedTokens"], 44);
+    assert_eq!(c["performance"]["timedOutputTokens"], 16);
+    assert_eq!(c["performance"]["totalDurationMs"], 2000);
+    assert_eq!(c["performance"]["sampleCount"], 2);
+}
+
+#[test]
+fn source_snapshots_claude_mirror_requires_project_session_relationship() {
+    use crate::sessions::claudecode::is_ssh_mirror;
+    use std::path::Path;
+    assert!(is_ssh_mirror(Path::new(
+        "/home/.claude/projects/ssh-session/session.jsonl"
+    )));
+    assert!(is_ssh_mirror(Path::new(
+        "/home/.claude/projects/ssh-session/session/subagents/agent-a.jsonl"
+    )));
+    assert!(!is_ssh_mirror(Path::new(
+        "/home/.claude/projects/ssh-session/unrelated.jsonl"
+    )));
+    assert!(!is_ssh_mirror(Path::new("/home/ssh-session/session.jsonl")));
+    assert!(!is_ssh_mirror(Path::new(
+        "/home/.claude/projects/ssh-/session.jsonl"
+    )));
+}
+
+#[test]
+fn source_snapshots_model_performance_matches_timed_output_and_reasoning() {
+    let mut timed = message(
+        "claude",
+        "session",
+        "2026-03-02",
+        "model",
+        10,
+        Some("message:timed"),
+    );
+    timed.tokens.output = 5;
+    timed.tokens.reasoning = 3;
+    timed.duration_ms = Some(1000);
+    let mut untimed = timed.clone();
+    untimed.dedup_key = Some("message:untimed".into());
+    untimed.tokens.output = 100;
+    untimed.tokens.reasoning = 50;
+    untimed.duration_ms = None;
+    let rows = vec![timed, untimed];
+    let entries = crate::aggregate_model_usage_entries_with_source_performance(
+        rows.clone(),
+        &GroupBy::Model,
+        WorktreeRollup::default(),
+        &mut crate::WorkspaceLabeler::default(),
+        true,
+    );
+    assert_eq!(entries[0].performance.timed_output_tokens, Some(8));
+    assert_eq!(entries[0].performance.timed_tokens, 18);
+    let ordinary = crate::aggregate_model_usage_entries_with_labeler(
+        rows,
+        &GroupBy::Model,
+        WorktreeRollup::default(),
+        &mut crate::WorkspaceLabeler::default(),
+    );
+    assert!(ordinary[0].performance.timed_output_tokens.is_none());
 }
