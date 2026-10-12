@@ -2433,7 +2433,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
             // Old cache envelopes have no session inventory/read proof. Pair
             // fresh evidence with fresh rows, never upgrade a cache hit to complete.
             let before = message_cache::SourceFingerprint::from_sqlite_path_exact(db_path);
-            let source = sessions::micode::parse_micode_source(db_path);
+            let source = sessions::micode::parse_micode_source_for_export(db_path);
             let after = message_cache::SourceFingerprint::from_sqlite_path_exact(db_path);
             micode_evidence.complete &= source.complete && before.is_some() && before == after;
             micode_evidence

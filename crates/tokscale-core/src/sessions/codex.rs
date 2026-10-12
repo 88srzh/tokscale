@@ -1260,17 +1260,19 @@ fn parse_codex_reader<R: BufRead>(
                     // The raw parent thread id; reports and the TUI resolve it
                     // to a surviving parent rollout after their own filtering.
                     message.parent_session_id = state.session_parent_thread_id.clone();
-                    message.source_group_key = state
-                        .session_forked_from_id
-                        .as_deref()
-                        .or(state.session_id_from_meta.as_deref())
-                        .zip(state.current_turn_id.as_deref())
-                        .filter(|(session, turn)| {
-                            !session.trim().is_empty() && !turn.trim().is_empty()
-                        })
-                        .map(|(session, turn)| {
-                            crate::source_snapshot::codex_group_key(session, turn)
-                        });
+                    if source_health {
+                        message.source_group_key = state
+                            .session_forked_from_id
+                            .as_deref()
+                            .or(state.session_id_from_meta.as_deref())
+                            .zip(state.current_turn_id.as_deref())
+                            .filter(|(session, turn)| {
+                                !session.trim().is_empty() && !turn.trim().is_empty()
+                            })
+                            .map(|(session, turn)| {
+                                crate::source_snapshot::codex_group_key(session, turn)
+                            });
+                    }
                     state.turn_coverage.record(state.current_turn_id.as_deref());
                     // The announced turn has produced usage, so it is under
                     // way: a `turn_context` without an id that comes later
@@ -1732,7 +1734,7 @@ fn parse_codex_file_with_source_health(
                 fallback_timestamp_indices: Vec::new(),
                 consumed_offset: start_offset,
                 parse_succeeded: false,
-                    source_read_succeeded: false,
+                source_read_succeeded: false,
                 unresolved_model_events: false,
                 state,
             };
@@ -1776,14 +1778,21 @@ fn parse_codex_file_with_source_health(
                 fallback_timestamp_indices: Vec::new(),
                 consumed_offset: 0,
                 parse_succeeded: false,
-                    source_read_succeeded: false,
+                source_read_succeeded: false,
                 unresolved_model_events: false,
                 state,
             };
         }
 
         let reader = BufReader::new(decoder.take(MAX_ARCHIVE_BYTES + 1));
-        let mut parsed = parse_codex_reader(reader, &session_id, fallback_timestamp, 0, state, source_health);
+        let mut parsed = parse_codex_reader(
+            reader,
+            &session_id,
+            fallback_timestamp,
+            0,
+            state,
+            source_health,
+        );
         if parsed.consumed_offset > MAX_ARCHIVE_BYTES || !parsed.parse_succeeded {
             parsed.messages.clear();
             parsed.fallback_timestamp_indices.clear();
@@ -2146,8 +2155,12 @@ mod tests {
             );
             assert_eq!(
                 source.messages[0].source_group_key,
-                native.messages[0].source_group_key
+                Some(crate::source_snapshot::codex_group_key(
+                    "upstream",
+                    "stable-turn"
+                ))
             );
+            assert!(native.messages[0].source_group_key.is_none());
         }
     }
 

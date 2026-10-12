@@ -101,8 +101,8 @@ pub struct UnifiedMessage {
     pub message_count: i32,
     pub agent: Option<String>,
     pub dedup_key: Option<String>,
-    /// Export-only stable source group. Codex stores it beside messages in its
-    /// own cache envelope; it never participates in normal scanner dedup.
+    /// Transient export-only stable source group, calculated during a fresh
+    /// source read; never persisted or used by normal scanner dedup.
     #[serde(skip)]
     pub source_group_key: Option<String>,
     /// Human-readable session title/name when the source client stores one

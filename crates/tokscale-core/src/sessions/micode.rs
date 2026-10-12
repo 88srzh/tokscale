@@ -490,6 +490,15 @@ fn merge_workspace(retained: &mut UnifiedMessage, incoming: &UnifiedMessage, con
 /// snapshot. The shared decoder emits exact raw timing with each accepted row,
 /// so the reducer and its cache never need to query the database again.
 pub(crate) fn parse_micode_source(db_path: &Path) -> MiMoSource {
+    parse_micode_source_with_config(db_path, OpenCodeSchemaConfig::micode())
+}
+
+/// Source export pairs tolerant native rows with strict, freshly read health.
+pub(crate) fn parse_micode_source_for_export(db_path: &Path) -> MiMoSource {
+    parse_micode_source_with_config(db_path, OpenCodeSchemaConfig::micode_for_source())
+}
+
+fn parse_micode_source_with_config(db_path: &Path, cfg: OpenCodeSchemaConfig) -> MiMoSource {
     #[cfg(test)]
     io_tests::record_open();
     let Some(conn) = open_readonly_sqlite_opt(db_path) else {
@@ -506,12 +515,8 @@ pub(crate) fn parse_micode_source(db_path: &Path) -> MiMoSource {
         .filter(|(_, info)| info.desktop)
         .map(|(id, _)| (id.clone(), MICODE_DESKTOP_CLIENT_ID.to_string()))
         .collect();
-    let (messages, rows, complete) = parse_opencode_schema_rows_on(
-        db_path,
-        &conn,
-        OpenCodeSchemaConfig::micode(),
-        &session_clients,
-    );
+    let (messages, rows, complete) =
+        parse_opencode_schema_rows_on(db_path, &conn, cfg, &session_clients);
     let mut observed_sessions: Vec<_> = sessions
         .iter()
         .map(|(id, info)| {
@@ -872,7 +877,7 @@ mod tests {
                 .insert(key.into(), value);
             conn.execute("UPDATE message SET data=?1", [data.to_string()])
                 .unwrap();
-            let source = parse_micode_source(&db_path);
+            let source = parse_micode_source_for_export(&db_path);
             assert!(!source.complete, "{pointer}: {data}");
             assert_eq!(source.messages.len(), expected_rows, "{data}");
             assert_eq!(source.messages.len(), source.metadata.len());
@@ -923,7 +928,7 @@ mod tests {
                 [r#"{"role":"user","tokens":"not usage","cost":"metadata"}"#],
             )
             .unwrap();
-            let source = parse_micode_source(&db_path);
+            let source = parse_micode_source_for_export(&db_path);
             assert!(source.complete, "{data}");
             assert_eq!(source.messages.len(), 1);
             assert_eq!(source.messages[0].tokens.total(), 0);
@@ -934,12 +939,12 @@ mod tests {
         }
         conn.execute("UPDATE message SET data=json_set(data,'$.cost',0,'$.usage',json('{\"input_tokens\":0,\"service_tier\":\"standard\",\"future\":{\"info\":\"metadata\"}}')) WHERE id='row'", []).unwrap();
         assert!(
-            parse_micode_source(&db_path).complete,
+            parse_micode_source_for_export(&db_path).complete,
             "integer zero cost and non-usage metadata"
         );
         conn.execute("DELETE FROM message WHERE id='row'", [])
             .unwrap();
-        let empty = parse_micode_source(&db_path);
+        let empty = parse_micode_source_for_export(&db_path);
         assert!(empty.complete);
         assert!(empty.messages.is_empty());
         assert_eq!(

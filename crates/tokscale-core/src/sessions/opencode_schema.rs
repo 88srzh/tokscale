@@ -243,6 +243,8 @@ pub(crate) struct OpenCodeSchemaConfig {
     /// Require `$.tokens.cache` to be present with both `read` and `write`,
     /// dropping the message otherwise.
     pub strict_cache: bool,
+    /// Validate raw MiMo accounting only for opt-in source-read authority.
+    source_accounting_health: bool,
     /// Treat an epoch at or below 1e12 as seconds and scale it to milliseconds.
     pub normalize_epoch_seconds: bool,
     /// Timestamp to use when the payload has no `$.time`. `None` drops such a
@@ -279,6 +281,7 @@ impl OpenCodeSchemaConfig {
             normalize_agent: true,
             prefer_mode_over_agent: true,
             strict_cache: true,
+            source_accounting_health: false,
             normalize_epoch_seconds: false,
             fallback_timestamp: None,
             record_duration: true,
@@ -316,6 +319,14 @@ impl OpenCodeSchemaConfig {
             namespace_rowid_dedup_key: true,
             dedup: DedupMode::Merge,
             ..Self::base("micode")
+        }
+    }
+
+    pub(crate) const fn micode_for_source() -> Self {
+        Self {
+            query_groups: MICODE_SOURCE_QUERY_GROUPS,
+            source_accounting_health: true,
+            ..Self::micode()
         }
     }
 
@@ -589,6 +600,27 @@ const MICODE_QUERIES: &[&str] = &[
         FROM message m
         LEFT JOIN session s ON s.id = m.session_id
         WHERE json_extract(m.data, '$.role') = 'assistant'
+          AND json_extract(m.data, '$.tokens') IS NOT NULL
+        ORDER BY m.id, m.session_id
+    "#,
+    r#"
+        SELECT m.id, m.session_id, m.data, NULL AS workspace_root, NULL AS session_title, 1 AS eligible
+        FROM message m
+        WHERE json_extract(m.data, '$.role') = 'assistant'
+          AND json_extract(m.data, '$.tokens') IS NOT NULL
+        ORDER BY m.id, m.session_id
+    "#,
+];
+
+const MICODE_QUERY_GROUPS: &[&[&str]] = &[MICODE_QUERIES];
+
+// Source reads must also inspect assistant rows with absent/null accounting.
+const MICODE_SOURCE_QUERIES: &[&str] = &[
+    r#"
+        SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title, 1 AS eligible
+        FROM message m
+        LEFT JOIN session s ON s.id = m.session_id
+        WHERE json_extract(m.data, '$.role') = 'assistant'
         ORDER BY m.id, m.session_id
     "#,
     r#"
@@ -599,7 +631,7 @@ const MICODE_QUERIES: &[&str] = &[
     "#,
 ];
 
-const MICODE_QUERY_GROUPS: &[&[&str]] = &[MICODE_QUERIES];
+const MICODE_SOURCE_QUERY_GROUPS: &[&[&str]] = &[MICODE_SOURCE_QUERIES];
 
 /// Kilo: a single `message` table with no session join.
 ///
@@ -979,7 +1011,7 @@ impl SchemaAccumulator {
             super::micode::io_tests::record_decode();
         }
         let mut bytes = data_json.into_bytes();
-        let decoded = if cfg.client == super::micode::MICODE_CLIENT_ID {
+        let decoded = if cfg.source_accounting_health {
             simd_json::to_tape(&mut bytes).and_then(|tape| {
                 self.invalid_rows |= !micode_source_accounting_is_valid(tape.as_value());
                 tape.deserialize()
@@ -1467,7 +1499,7 @@ pub(crate) fn parse_opencode_schema_rows_on(
     (
         acc.messages,
         acc.raw_metadata.unwrap_or_default(),
-        complete && !acc.invalid_rows,
+        complete && (!cfg.source_accounting_health || !acc.invalid_rows),
     )
 }
 

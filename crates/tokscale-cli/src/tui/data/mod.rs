@@ -2060,6 +2060,7 @@ mod tests {
             message_count: 1,
             agent: Some("hephaestus".to_string()),
             dedup_key: None,
+            source_group_key: None,
             session_title: None,
             parent_session_id: None,
             is_turn_start: false,
