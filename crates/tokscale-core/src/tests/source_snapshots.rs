@@ -500,12 +500,13 @@ fn source_snapshots_model_performance_matches_timed_output_and_reasoning() {
     untimed.tokens.reasoning = 50;
     untimed.duration_ms = None;
     let rows = vec![timed, untimed];
-    let entries = crate::aggregate_model_usage_entries_with_source_performance(
+    let entries = crate::aggregate_model_usage_entries_with_source_metadata(
         rows.clone(),
         &GroupBy::Model,
         WorktreeRollup::default(),
         &mut crate::WorkspaceLabeler::default(),
         true,
+        None,
     );
     assert_eq!(entries[0].performance.timed_output_tokens, Some(8));
     assert_eq!(entries[0].performance.timed_tokens, 18);
@@ -516,4 +517,148 @@ fn source_snapshots_model_performance_matches_timed_output_and_reasoning() {
         &mut crate::WorkspaceLabeler::default(),
     );
     assert!(ordinary[0].performance.timed_output_tokens.is_none());
+}
+
+#[test]
+fn source_snapshots_unpriced_report_counters_preserve_nonzero_fallback_costs_and_authority() {
+    let options = ReportOptions::default();
+    let mut unknown = message(
+        "claude",
+        "session",
+        "2026-03-02",
+        "unknown",
+        10,
+        Some("first"),
+    );
+    unknown.tokens.output = 5;
+    unknown.tokens.reasoning = 3;
+    unknown.tokens.cache_read = 7;
+    unknown.tokens.cache_write = 5;
+    unknown.tokens.cache_write_1h = 2; // Subset already counted in cache_write.
+    unknown.cost = 2.5;
+    unknown.mark_estimated_cost();
+    let mut second = message(
+        "claude",
+        "session",
+        "2026-03-02",
+        "unknown",
+        50,
+        Some("second"),
+    );
+    second.cost = 1.5;
+    second.mark_estimated_cost();
+    let mut authoritative = message(
+        "claude",
+        "session",
+        "2026-03-02",
+        "unknown",
+        20,
+        Some("reported"),
+    );
+    authoritative.cost = 0.0;
+    authoritative.mark_provider_reported_cost();
+    let rows = vec![unknown, second, authoritative];
+    let graph = snapshot(&options, rows.clone(), None);
+    assert_eq!(graph.contributions[0].clients[0].unpriced_tokens, Some(80));
+    assert_eq!(graph.summary.total_cost, 4.0);
+    let source_total: i64 = graph
+        .source_usage
+        .as_ref()
+        .unwrap()
+        .sessions
+        .iter()
+        .flat_map(|session| &session.events)
+        .flat_map(|event| &event.contributions)
+        .map(|row| row.pricing.as_ref().unwrap().unpriced_tokens)
+        .sum();
+    assert_eq!(source_total, 80);
+    let entries = crate::aggregate_model_usage_entries_with_source_metadata(
+        rows.clone(),
+        &GroupBy::Model,
+        WorktreeRollup::default(),
+        &mut crate::WorkspaceLabeler::default(),
+        true,
+        None,
+    );
+    assert_eq!(entries[0].unpriced_tokens, Some(80));
+    assert_eq!(entries[0].cost, 4.0);
+    let ordinary = crate::aggregate_model_usage_entries_with_labeler(
+        rows.clone(),
+        &GroupBy::Model,
+        WorktreeRollup::default(),
+        &mut crate::WorkspaceLabeler::default(),
+    );
+    assert!(ordinary[0].unpriced_tokens.is_none());
+    let legacy = serde_json::to_value(crate::aggregator::aggregate_by_date(rows)).unwrap();
+    assert!(legacy[0]["clients"][0].get("unpricedTokens").is_none());
+    let mut legacy_row = serde_json::to_value(&graph.contributions[0].clients[0]).unwrap();
+    legacy_row.as_object_mut().unwrap().remove("unpricedTokens");
+    let decoded: crate::ClientContribution = serde_json::from_value(legacy_row).unwrap();
+    assert!(decoded.unpriced_tokens.is_none());
+}
+
+#[test]
+fn source_snapshots_claude_declared_null_accounting_is_partial_but_missing_optional_is_supported() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("session.jsonl");
+    let legacy = serde_json::json!({
+        "type": "assistant", "timestamp": "2026-03-02T00:00:00Z", "requestId": "request",
+        "message": {"id": "same", "model": "unpriced-fixture-model", "usage": {
+            "input_tokens": 100, "output_tokens": 0,
+        }},
+    });
+    std::fs::write(&path, legacy.to_string()).unwrap();
+    let (rows, complete) =
+        crate::sessions::claudecode::parse_claude_file_for_source(&path, Some(home.path()));
+    assert!(complete);
+    let id = source_event_id(&rows[0]);
+    for pointer in [
+        "/message/usage/input_tokens",
+        "/message/usage/output_tokens",
+        "/message/usage/cache_read_input_tokens",
+        "/message/usage/cache_creation_input_tokens",
+        "/message/usage/cache_creation",
+        "/message/usage/cache_creation/ephemeral_1h_input_tokens",
+        "/message/usage/cache_creation/ephemeral_5m_input_tokens",
+        "/message/usage/cached_input_tokens",
+        "/message/usage/reasoning_output_tokens",
+        "/message/usage/inputTokens",
+        "/message/usage/outputTokens",
+        "/message/usage/total_tokens",
+        "/message/usage/output_tokens_details",
+        "/message/usage/performance",
+        "/message/performance",
+        "/performance",
+        "/duration_ms",
+        "/message/durationMs",
+    ] {
+        let mut row = legacy.clone();
+        let keys: Vec<_> = pointer.trim_start_matches('/').split('/').collect();
+        let mut value = &mut row;
+        for key in &keys[..keys.len() - 1] {
+            if !value[*key].is_object() {
+                value[*key] = serde_json::json!({});
+            }
+            value = &mut value[*key];
+        }
+        value[keys[keys.len() - 1]] = serde_json::Value::Null;
+        std::fs::write(&path, row.to_string()).unwrap();
+        let (rows, complete) =
+            crate::sessions::claudecode::parse_claude_file_for_source(&path, Some(home.path()));
+        assert!(!complete, "{pointer}");
+        if let Some(row) = rows.first() {
+            assert_eq!(source_event_id(row), id, "{pointer}");
+        }
+    }
+    // A null request-start timestamp must not certify a lost timed sample.
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}",
+            serde_json::json!({"type":"user", "timestamp":null}),
+            legacy
+        ),
+    )
+    .unwrap();
+    assert!(!crate::sessions::claudecode::parse_claude_file_for_source(&path, Some(home.path())).1);
 }

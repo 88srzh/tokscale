@@ -458,14 +458,44 @@ pub(crate) fn parse_claude_file_for_source(
 }
 
 fn valid_source_line(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
     let Ok(entry) = serde_json::from_str::<ClaudeEntry>(line) else {
         return false;
     };
+    if matches!(
+        entry.entry_type.as_str(),
+        "assistant" | "user" | "tool_result"
+    ) {
+        for container in [Some(&value), value.get("message")].into_iter().flatten() {
+            if [
+                "performance",
+                "duration",
+                "durationMs",
+                "duration_ms",
+                "totalDurationMs",
+                "total_duration_ms",
+                "timedTokens",
+                "timed_tokens",
+                "timedOutputTokens",
+                "timed_output_tokens",
+            ]
+            .iter()
+            .any(|key| container.get(key).is_some())
+            {
+                // These layouts are not consumed by the native Claude timing parser.
+                return false;
+            }
+        }
+        if value.get("timestamp").is_some()
+            && parse_claude_entry_timestamp(entry.timestamp.as_deref()).is_none()
+        {
+            return false;
+        }
+    }
     if entry.entry_type != "assistant" {
         // Ignore non-accounting metadata, but do not certify unknown usage layouts.
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            return false;
-        };
         return value.get("usage").is_none()
             && (matches!(entry.entry_type.as_str(), "user" | "tool_result")
                 || value.pointer("/message/usage").is_none());
@@ -491,9 +521,6 @@ fn valid_source_line(line: &str) -> bool {
     {
         return false;
     }
-    let Ok(value) = serde_json::from_str::<Value>(line) else {
-        return false;
-    };
     if value.get("usage").is_some() {
         return false;
     }
@@ -509,9 +536,6 @@ fn valid_source_line(line: &str) -> bool {
         }
     }
     for (key, value) in usage {
-        if value.is_null() {
-            continue;
-        }
         if key == "cache_creation" {
             let Some(cache) = value.as_object() else {
                 return false;

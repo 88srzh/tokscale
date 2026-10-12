@@ -7578,6 +7578,17 @@ fn snapshot_export(home: &Path, extra: &[&str]) -> serde_json::Value {
     serde_json::from_slice(&output).unwrap()
 }
 
+// Compare legacy accounting while independently testing the additive opt-in counters.
+fn legacy_graph_contributions(graph: &serde_json::Value) -> serde_json::Value {
+    let mut contributions = graph["contributions"].clone();
+    for day in contributions.as_array_mut().unwrap() {
+        for client in day["clients"].as_array_mut().unwrap() {
+            client.as_object_mut().unwrap().remove("unpricedTokens");
+        }
+    }
+    contributions
+}
+
 fn source_events(source: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
     source["sessions"]
         .as_array()
@@ -7671,7 +7682,7 @@ fn test_graph_source_snapshots_v2_contract_timestamp_projection_and_default_outp
     assert_eq!(graph["summary"]["totalTokens"], 37);
     let normal = native_graph(tmp.path(), "opencode");
     assert!(normal.get("sourceUsage").is_none());
-    assert_eq!(normal["contributions"], graph["contributions"]);
+    assert_eq!(normal["contributions"], legacy_graph_contributions(&graph));
     for command in ["submit", "import"] {
         cmd_with_home(tmp.path())
             .args([command, "--source-snapshots", "--no-spinner"])
@@ -7883,7 +7894,7 @@ fn test_graph_source_snapshots_codex_complete45_partial15_complete15_cache_and_e
         id
     );
     assert_eq!(
-        corrected["contributions"],
+        legacy_graph_contributions(&corrected),
         native_graph(tmp.path(), "codex")["contributions"]
     );
     // Ownership changes leave the upstream turn identity unchanged.
@@ -7964,7 +7975,7 @@ fn test_graph_source_snapshots_codex_owner_a100_to_b20_has_stable_transient_turn
             id
         );
         assert_eq!(
-            corrected["contributions"],
+            legacy_graph_contributions(&corrected),
             native_graph(tmp.path(), "codex")["contributions"]
         );
     }
@@ -8023,7 +8034,7 @@ fn test_graph_source_snapshots_codex_schema_invalid_usage_is_partial_with_warm_n
                 id
             );
             assert_eq!(
-                partial["contributions"],
+                legacy_graph_contributions(&partial),
                 native_graph(tmp.path(), "codex")["contributions"]
             );
         }
@@ -8122,7 +8133,7 @@ fn test_graph_source_snapshots_mimo_shared_store_transfer_lower_zero_and_partial
             scope_id = Some(session["scopeId"].clone());
         }
         assert_eq!(
-            graph["contributions"],
+            legacy_graph_contributions(&graph),
             native_graph(tmp.path(), "micode,micode-desktop")["contributions"]
         );
         if !desktop {
@@ -8258,7 +8269,10 @@ fn test_graph_source_snapshots_mimo_invalid_accounting_after_warm_native_cache()
             source_events(&partial["sourceUsage"]).next().unwrap()["id"],
             id
         );
-        assert_eq!(partial["contributions"], native["contributions"]);
+        assert_eq!(
+            legacy_graph_contributions(&partial),
+            native["contributions"]
+        );
     }
     let mut valid = invalid.clone();
     valid["tokens"]["input"] = 0.into();
@@ -8292,7 +8306,11 @@ fn test_graph_source_snapshots_mimo_invalid_accounting_after_warm_native_cache()
         assert_eq!(cold["contributions"], warm["contributions"]);
         let partial = snapshot_export(tmp.path(), &clients);
         assert_eq!(only_scope(&partial)["readStatus"], "partial", "{data}");
-        assert_eq!(partial["contributions"], warm["contributions"], "{data}");
+        assert_eq!(
+            legacy_graph_contributions(&partial),
+            warm["contributions"],
+            "{data}"
+        );
     }
     write_snapshot_mimo(tmp.path(), true, 15, true);
     let corrected = snapshot_export(tmp.path(), &clients);
@@ -8534,8 +8552,8 @@ fn test_native_source_snapshots_claude_json_config_roots_union_native_wins_and_g
         overlap["contributions"][0]["performance"]["timedTokens"],
         10
     );
-    assert!(report["sessions"].as_array().unwrap().len() > 0);
-    assert!(report["workspaces"].as_array().unwrap().len() > 0);
+    assert!(!report["sessions"].as_array().unwrap().is_empty());
+    assert!(!report["workspaces"].as_array().unwrap().is_empty());
     let graph_bytes = cmd_with_home(home.path())
         .env("TOKSCALE_SCAN_ROOTS_JSON", &roots)
         .args([
@@ -8890,4 +8908,230 @@ fn test_native_source_snapshots_exact_timed_output_conserves_grouped_contributio
     );
     let report = claude_native_evidence(home.path(), None, &[]);
     assert_eq!(report["entries"][0]["performance"]["timedOutputTokens"], 0);
+}
+
+#[test]
+fn test_source_snapshots_unpriced_counters_match_native_graph_and_event_contributions() {
+    let home = TempDir::new().unwrap();
+    prime_pricing_cache(home.path());
+    pin_bucket_timezone(home.path(), "Etc/UTC");
+    for (session, input) in [("first", 30), ("second", 50)] {
+        write_claude_evidence(
+            &home
+                .path()
+                .join(format!(".claude/projects/-work/{session}.jsonl")),
+            &[
+                claude_evidence_row(Some(session), input, "2026-03-02T00:00:00Z"),
+                claude_evidence_row(Some("excluded"), 100, "2026-03-01T00:00:00Z"),
+            ],
+        );
+    }
+    let read = |graph: bool, snapshots: bool, group: &str| {
+        let mut command = cmd_with_home(home.path());
+        if graph {
+            command.arg("graph");
+        } else {
+            command.args(["--json", "--group-by", group]);
+        }
+        command.args([
+            "--client",
+            "claude",
+            "--no-spinner",
+            "--since",
+            "2026-03-02",
+            "--until",
+            "2026-03-02",
+        ]);
+        if snapshots {
+            command.arg("--source-snapshots");
+        }
+        let bytes = command.assert().success().get_output().stdout.clone();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let event_unpriced = |report: &serde_json::Value| {
+        source_events(&report["sourceUsage"])
+            .flat_map(|event| event["contributions"].as_array().unwrap())
+            .map(|row| row["pricing"]["unpricedTokens"].as_i64().unwrap())
+            .sum::<i64>()
+    };
+    let graph = read(true, true, "model");
+    assert_eq!(graph["summary"]["totalTokens"], 80);
+    assert_eq!(event_unpriced(&graph), 80);
+    assert_eq!(
+        graph["contributions"][0]["clients"][0]["unpricedTokens"],
+        80
+    );
+    let ordinary_graph = read(true, false, "model");
+    assert!(ordinary_graph["contributions"][0]["clients"][0]
+        .get("unpricedTokens")
+        .is_none());
+    assert_eq!(
+        graph["summary"]["totalCost"],
+        ordinary_graph["summary"]["totalCost"]
+    );
+    for group in [
+        "model",
+        "client,model",
+        "client,provider,model",
+        "workspace,model",
+        "session,model",
+        "client,session,model",
+        "client,workspace,session,model",
+    ] {
+        let native = read(false, true, group);
+        assert_eq!(native["totalInput"], 80, "{group}");
+        assert_eq!(event_unpriced(&native), 80, "{group}");
+        assert_eq!(
+            native["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["unpricedTokens"].as_i64().unwrap())
+                .sum::<i64>(),
+            80,
+            "{group}"
+        );
+        assert!(
+            read(false, false, group)["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry.get("unpricedTokens").is_none()),
+            "{group}"
+        );
+    }
+}
+
+#[test]
+fn test_source_snapshots_covered_usage_has_explicit_zero_unpriced_counters() {
+    let home = TempDir::new().unwrap();
+    prime_canonical_sonnet_pricing_cache(home.path(), "claude-sonnet-4-20250514");
+    pin_bucket_timezone(home.path(), "Etc/UTC");
+    let mut row: serde_json::Value = serde_json::from_str(&claude_evidence_row(
+        Some("covered"),
+        80,
+        "2026-03-02T00:00:00Z",
+    ))
+    .unwrap();
+    row["message"]["model"] = "claude-sonnet-4-20250514".into();
+    write_claude_evidence(
+        &home.path().join(".claude/projects/-work/session.jsonl"),
+        &[row.to_string()],
+    );
+    // Coverage, including a declared free rate, determines unpriced usage; cost == 0 does not.
+    for free in [false, true] {
+        if free {
+            let cache = home.path().join(".config/tokscale/cache");
+            for name in [
+                "pricing-litellm.json",
+                "pricing-openrouter.json",
+                "pricing-models-dev.json",
+            ] {
+                let path = cache.join(name);
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                for model in value["data"].as_object_mut().unwrap().values_mut() {
+                    for rate in model.as_object_mut().unwrap().values_mut() {
+                        *rate = 0.into();
+                    }
+                }
+                fs::write(path, value.to_string()).unwrap();
+            }
+        }
+        let native = claude_native_evidence(home.path(), None, &[]);
+        assert_eq!(native["entries"][0]["unpricedTokens"], 0);
+        assert_eq!(
+            source_events(&native["sourceUsage"]).next().unwrap()["contributions"][0]["pricing"]
+                ["unpricedTokens"],
+            0
+        );
+        assert_eq!(native["totalCost"].as_f64().unwrap() > 0.0, !free);
+        let bytes = cmd_with_home(home.path())
+            .args([
+                "graph",
+                "--source-snapshots",
+                "--client",
+                "claude",
+                "--no-spinner",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let graph: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(graph["contributions"][0]["clients"][0]["unpricedTokens"], 0);
+        assert_eq!(
+            source_events(&graph["sourceUsage"]).next().unwrap()["contributions"][0]["pricing"]
+                ["unpricedTokens"],
+            0
+        );
+        assert_eq!(graph["summary"]["totalCost"].as_f64().unwrap() > 0.0, !free);
+    }
+}
+
+#[test]
+fn test_source_snapshots_claude_null_after_complete_is_partial_with_stable_native_and_graph_identity(
+) {
+    let home = TempDir::new().unwrap();
+    prime_pricing_cache(home.path());
+    pin_bucket_timezone(home.path(), "Etc/UTC");
+    let path = home.path().join(".claude/projects/-work/session.jsonl");
+    let mut row: serde_json::Value = serde_json::from_str(&claude_evidence_row(
+        Some("same"),
+        100,
+        "2026-03-02T00:00:00Z",
+    ))
+    .unwrap();
+    row["message"]["usage"]["cache_read_input_tokens"] = 50.into();
+    let read_graph = || {
+        let bytes = cmd_with_home(home.path())
+            .args([
+                "graph",
+                "--source-snapshots",
+                "--client",
+                "claude",
+                "--no-spinner",
+            ])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    write_claude_evidence(&path, &[row.to_string()]);
+    let native = claude_native_evidence(home.path(), None, &[]);
+    let graph = read_graph();
+    let id = source_events(&native["sourceUsage"]).next().unwrap()["id"].clone();
+    assert_eq!(native["entries"][0]["unpricedTokens"], 150);
+    assert_eq!(
+        graph["contributions"][0]["clients"][0]["unpricedTokens"],
+        150
+    );
+    for report in [&native, &graph] {
+        assert_eq!(only_scope(report)["readStatus"], "complete");
+        assert_eq!(only_scope(report)["identityStatus"], "exact");
+        assert_eq!(
+            source_events(&report["sourceUsage"]).next().unwrap()["id"],
+            id
+        );
+    }
+    // The tolerant row is still visible, but cannot replace accepted 150-token proof.
+    row["message"]["usage"]["cache_read_input_tokens"] = serde_json::Value::Null;
+    write_claude_evidence(&path, &[row.to_string()]);
+    let native = claude_native_evidence(home.path(), None, &[]);
+    let graph = read_graph();
+    assert_eq!(native["entries"][0]["unpricedTokens"], 100);
+    assert_eq!(
+        graph["contributions"][0]["clients"][0]["unpricedTokens"],
+        100
+    );
+    for report in [&native, &graph] {
+        assert_eq!(only_scope(report)["readStatus"], "partial");
+        assert_eq!(
+            source_events(&report["sourceUsage"]).next().unwrap()["id"],
+            id
+        );
+    }
 }

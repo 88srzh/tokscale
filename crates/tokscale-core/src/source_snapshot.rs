@@ -186,17 +186,7 @@ impl SourceContribution {
             .cache_write_1h
             .saturating_add(message.tokens.cache_write_1h);
         let total = crate::positive_token_total(&message.tokens);
-        // The same authoritative-cost / covered-usage predicate as native unpriced classification.
-        let unpriced = total > 0
-            && !message.has_authoritative_cost()
-            && pricing.is_none_or(|pricing| {
-                !pricing.covers_usage_with_provider(
-                    &message.model_id,
-                    Some(&message.provider_id),
-                    &message.tokens,
-                )
-            });
-        if unpriced {
+        if crate::message_has_unpriced_usage(message, pricing) {
             let pricing = self.pricing.get_or_insert_with(SourcePricing::default);
             pricing.unpriced_tokens = pricing.unpriced_tokens.saturating_add(total);
             pricing.unpriced_messages = pricing
