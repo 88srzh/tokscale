@@ -569,8 +569,20 @@ fn codex_source_usage_is_valid(value: &Value, typed_decode_succeeded: bool) -> b
         }
     }
     if is_token_count {
+        // Even a zero snapshot can clear an older event. A malformed explicit
+        // timestamp is not date evidence merely because no row was emitted.
+        if let Some(timestamp) = value.get("timestamp").filter(|v| !v.is_null()) {
+            if parse_codex_entry_timestamp(timestamp.as_str()).is_none() {
+                return false;
+            }
+        }
         // Codex legitimately emits info:null for rate-limit-only updates.
         if let Some(info) = payload.and_then(|p| p.get("info")).filter(|v| !v.is_null()) {
+            // Typed serde decoding also accepts positional struct arrays.
+            // Only an object exposes all declared accounting to this validator.
+            if !info.is_object() {
+                return false;
+            }
             for key in ["last_token_usage", "total_token_usage"] {
                 if let Some(usage) = info.get(key).filter(|v| !v.is_null()) {
                     if !codex_source_usage_numbers_are_valid(usage, false) {
@@ -604,7 +616,7 @@ fn codex_source_usage_is_valid(value: &Value, typed_decode_succeeded: bool) -> b
     .into_iter()
     .flatten()
     {
-        if let Some(usage) = container.get("usage") {
+        if let Some(usage) = container.get("usage").filter(|v| !v.is_null()) {
             if !codex_source_usage_numbers_are_valid(usage, true)
                 || observed_headless_usage.is_some_and(|prior| prior != usage)
                 || ((requires_typed_decode
@@ -2110,6 +2122,9 @@ mod tests {
     #[test]
     fn codex_source_health_rejects_schema_invalid_usage_without_changing_native_rows() {
         let invalid_records = [
+            r#"{"timestamp":"invalid-timestamp","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":0}}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":[null,null,null,{"input_tokens":-1},null]}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":[null,null,null,{"input_tokens":0},null]}}"#,
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":"not-a-number"},"last_token_usage":{"input_tokens":"not-a-number"}}}}"#,
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":[]}}}"#,
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{}}}}"#,
@@ -2179,6 +2194,10 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":null,"total_token_usage":null}}}"#,
             r#"{"type":"token_usage_record","payload":{"service_tier":"priority","usage":null}}"#,
             r#"{"type":"token_usage_record","payload":{"service_tier":"priority"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":null},"usage":null}"#,
+            r#"{"type":"result","data":{"usage":null}}"#,
+            r#"{"type":"result","result":{"usage":null}}"#,
+            r#"{"type":"result","response":{"usage":null}}"#,
         ] {
             let file = create_test_file(&format!("{SOURCE_HEALTH_PREFIX}{record}\n"));
             let source = parse_codex_file_for_source(file.path());

@@ -425,3 +425,49 @@ fn source_snapshots_are_absent_without_opt_in() {
         assert!(graph.source_usage.is_none());
     }
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn source_snapshots_codex_mtime_fallback_cannot_authorize_date_replacement() {
+    let cache_home = tempfile::TempDir::new().unwrap();
+    let source_home = tempfile::TempDir::new().unwrap();
+    let _env = redirect_cache_home(cache_home.path());
+    let directory = source_home.path().join(".codex/sessions");
+    std::fs::create_dir_all(&directory).unwrap();
+    let file = directory.join("rollout-2026-03-02-upstream.jsonl");
+    for (timestamp, expected) in [
+        (Some("2026-03-02T18:00:00Z"), "complete"),
+        (Some("invalid-timestamp"), "partial"),
+        (None, "partial"),
+    ] {
+        let mut usage = serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{
+            "last_token_usage":{"input_tokens":20},"total_token_usage":{"input_tokens":20}
+        }}});
+        if let Some(timestamp) = timestamp {
+            usage["timestamp"] = timestamp.into();
+        }
+        std::fs::write(&file, format!(
+            "{}\n{}\n{usage}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":"upstream","model_provider":"openai"}}),
+            serde_json::json!({"type":"turn_context","payload":{"turn_id":"turn","model":"gpt-5.4"}}),
+        )).unwrap();
+        // Tolerant native accounting still counts fallback-dated usage.
+        assert_eq!(sessions::codex::parse_codex_file(&file)[0].tokens.input, 20);
+        let report = generate_graph_with_loaded_pricing(
+            ReportOptions {
+                home_dir: Some(source_home.path().to_string_lossy().into_owned()),
+                use_env_roots: false,
+                scanner_settings: scanner::ScannerSettings {
+                    bucket_timezone: Some("UTC".into()),
+                    ..Default::default()
+                },
+                ..selected(&["codex"])
+            },
+            None,
+            GraphPricingRequirement::LenientSourceSnapshots,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.source_usage.unwrap().scopes[0].read_status, expected);
+    }
+}

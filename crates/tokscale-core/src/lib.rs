@@ -2568,6 +2568,9 @@ fn parse_all_messages_streaming<S: MessageSink>(
                         "codex",
                         parsed.source_read_succeeded
                             && !parsed.unresolved_model_events
+                            // Mtime keeps tolerant native rows displayable, but
+                            // cannot prove the date of a replaceable event.
+                            && parsed.fallback_timestamp_indices.is_empty()
                             && before.is_some()
                             && before == after,
                         true,
