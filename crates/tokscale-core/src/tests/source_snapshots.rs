@@ -471,3 +471,43 @@ async fn source_snapshots_codex_mtime_fallback_cannot_authorize_date_replacement
         assert_eq!(report.source_usage.unwrap().scopes[0].read_status, expected);
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn source_snapshots_codex_missing_symlink_target_is_partial() {
+    let cache_home = tempfile::TempDir::new().unwrap();
+    let source_home = tempfile::TempDir::new().unwrap();
+    let _env = redirect_cache_home(cache_home.path());
+    let directory = source_home.path().join(".codex/sessions");
+    std::fs::create_dir_all(&directory).unwrap();
+    let target = source_home.path().join("target.jsonl");
+    std::os::unix::fs::symlink(&target, directory.join("rollout-linked.jsonl")).unwrap();
+    std::fs::write(&target, concat!(
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"upstream\",\"model_provider\":\"openai\"}}\n",
+        "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"turn\",\"model\":\"gpt-5.4\"}}\n",
+        "{\"timestamp\":\"2026-03-02T18:00:00Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"last_token_usage\":{\"input_tokens\":30}}}}\n"
+    )).unwrap();
+    for expected in ["complete", "partial"] {
+        let report = generate_graph_with_loaded_pricing(
+            ReportOptions {
+                home_dir: Some(source_home.path().to_string_lossy().into_owned()),
+                use_env_roots: false,
+                scanner_settings: scanner::ScannerSettings {
+                    bucket_timezone: Some("UTC".into()),
+                    ..Default::default()
+                },
+                ..selected(&["codex"])
+            },
+            None,
+            GraphPricingRequirement::LenientSourceSnapshots,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.source_usage.unwrap().scopes[0].read_status, expected);
+        if expected == "complete" {
+            std::fs::remove_file(&target).unwrap();
+        }
+    }
+    assert!(scanner::scan_directory(directory.to_str().unwrap(), "*.jsonl*").is_empty());
+}

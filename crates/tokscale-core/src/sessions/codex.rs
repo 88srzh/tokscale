@@ -719,18 +719,16 @@ fn codex_source_usage_numbers_are_valid(usage: &Value, headless: bool) -> bool {
             counter(&["reasoning_output_tokens"]),
         )
     };
-    let accounted = input
-        .saturating_sub(cached)
-        .max(0)
-        .saturating_add(cached)
-        .saturating_add(output)
-        .saturating_add(reasoning);
+    // Native buckets split cache from input and reasoning from output. These
+    // subsets cannot explain extra declared tokens or require native clamping.
+    let subsets_valid = cached <= input && reasoning <= output;
+    let accounted = input.saturating_add(output);
     let total_explained = usage
         .get("total_tokens")
         .and_then(Value::as_i64)
         .is_none_or(|total| total <= accounted);
     // An empty/defaulted object is not proof of zero; explicit numeric zero is.
-    observed_counter && aliases_agree && total_explained
+    observed_counter && aliases_agree && subsets_valid && total_explained
 }
 
 fn parse_codex_reader<R: BufRead>(
@@ -2226,6 +2224,57 @@ mod tests {
                 serde_json::to_value(&source.messages).unwrap(),
                 serde_json::to_value(&native.messages).unwrap(),
                 "{record}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_source_health_checks_native_subset_accounting() {
+        for (counters, complete) in [
+            (
+                serde_json::json!({"input_tokens":0,"output_tokens":15,"reasoning_output_tokens":30,"total_tokens":45}),
+                false,
+            ),
+            (
+                serde_json::json!({"input_tokens":15,"cached_input_tokens":45,"total_tokens":45}),
+                false,
+            ),
+            (
+                serde_json::json!({"input_tokens":15,"cache_read_input_tokens":45}),
+                false,
+            ),
+            (
+                serde_json::json!({"output_tokens":30,"reasoning_output_tokens":15,"total_tokens":45}),
+                false,
+            ),
+            (
+                serde_json::json!({"input_tokens":15,"total_tokens":45}),
+                false,
+            ),
+            (
+                serde_json::json!({"input_tokens":15,"output_tokens":30,"cached_input_tokens":10,"reasoning_output_tokens":20,"total_tokens":45}),
+                true,
+            ),
+            (
+                serde_json::json!({"input_tokens":15,"cached_input_tokens":15,"total_tokens":15}),
+                true,
+            ),
+            (
+                serde_json::json!({"output_tokens":15,"reasoning_output_tokens":15,"total_tokens":15}),
+                true,
+            ),
+        ] {
+            let record = serde_json::json!({"timestamp":"2026-03-02T18:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{
+                "last_token_usage":counters,"total_token_usage":counters
+            }}});
+            let file = create_test_file(&format!("{SOURCE_HEALTH_PREFIX}{record}\n"));
+            let native = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+            let source = parse_codex_file_for_source(file.path());
+            assert_eq!(source.source_read_succeeded, complete, "{record}");
+            assert_eq!(
+                serde_json::to_value(&source.messages).unwrap(),
+                serde_json::to_value(&native.messages).unwrap(),
+                "source validation must not change tolerant native accounting: {record}"
             );
         }
     }

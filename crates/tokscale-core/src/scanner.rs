@@ -449,7 +449,7 @@ fn scan_directory_with_health(root: &str, pattern: &str) -> (Vec<PathBuf>, bool)
         Ok(_) => {}
         Err(error) => return (Vec::new(), error.kind() == std::io::ErrorKind::NotFound),
     }
-    let mut complete = true;
+    let complete = std::cell::Cell::new(true);
 
     // #1153: `~/.config/Code/logs` can hold tens of thousands of entries
     // (34,598 measured) from many extensions. The `codebuddy-extension-log`
@@ -483,7 +483,7 @@ fn scan_directory_with_health(root: &str, pattern: &str) -> (Vec<PathBuf>, bool)
         .filter_map(|entry| match entry {
             Ok(entry) => Some(entry),
             Err(_) => {
-                complete = false;
+                complete.set(false);
                 None
             }
         })
@@ -494,8 +494,7 @@ fn scan_directory_with_health(root: &str, pattern: &str) -> (Vec<PathBuf>, bool)
             // stat() per file (warm scans over huge trees were stat-bound).
             // Symlinks still fall back to a following stat to preserve behavior.
             let file_type = e.file_type();
-            let is_file = file_type.is_file() || (file_type.is_symlink() && path.is_file());
-            if !is_file {
+            if !file_type.is_file() && !file_type.is_symlink() {
                 return false;
             }
 
@@ -702,13 +701,27 @@ fn scan_directory_with_health(root: &str, pattern: &str) -> (Vec<PathBuf>, bool)
                 _ => false,
             }
         })
+        .filter(|entry| {
+            if !entry.file_type().is_symlink() {
+                return true;
+            }
+            match std::fs::metadata(entry.path()) {
+                Ok(metadata) => metadata.is_file(),
+                Err(_) => {
+                    // A discovered source candidate with an unreadable target
+                    // is a known incomplete read, not an absent contribution.
+                    complete.set(false);
+                    false
+                }
+            }
+        })
         .map(|e| e.path().to_path_buf())
         .collect();
     // Sort for deterministic ordering. sort_unstable() is sufficient (no stability
     // requirement for PathBuf) and avoids allocation. Note: ordering is byte-lexical,
     // not case-normalized (known Windows/macOS caveat for mixed-case paths).
     paths.sort_unstable();
-    (paths, complete)
+    (paths, complete.get())
 }
 
 /// Parse a `TOKSCALE_EXTRA_DIRS`-formatted string into (ClientId, path) pairs.

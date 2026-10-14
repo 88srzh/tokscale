@@ -61,6 +61,8 @@ MiMo inspects the raw declared accounting on the same parsed JSON tape before na
 
 IDs are observed before date filtering. A decoded Codex `session_meta` proves its native path-derived owner ID even when it emits no usage. MiMo's successfully read session table proves both raw surface IDs, including sessions without assistant rows; message IDs supplement compatible legacy databases without a session table. Those sessions export `events: []`. Inventory is filtered to literal selected raw clients; synthetic-only filters cannot turn excluded native rows into empty authoritative sessions. A file omitted from discovery is never an empty-session inventory entry. Ordinary parser-emitted zero rows still contribute their native message count. Codex's native suppression of zero token_count snapshots stays unchanged; an explicit complete empty session can carry the zero correction.
 
+Codex cache-read and reasoning counters are subsets of input and output respectively. Source validation rejects subset overflow instead of accepting native clamping, and a declared total is explained only by input plus output. A discovered candidate symlink whose target metadata cannot be read makes source traversal partial; ordinary tolerant scans still omit the unreadable file.
+
 `rowsWithoutIdentity` counts emitted rows before date filtering with blank/whitespace session IDs, `unknown`, or Copilot's `unknown-session` sentinel. Their accounting remains in aggregate graph contributions and outside identified snapshots. Copilot trace-ID fallback provenance is not upgraded to exact identity. Null event groups collect unresolved rows per session. Invalid/nonpositive timestamps or session identity gaps also prevent exact scope authority.
 
 ## Stable identity
