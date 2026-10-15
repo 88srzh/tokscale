@@ -313,8 +313,10 @@ pub struct ModelPerformance {
     pub ms_per_1k_tokens: Option<f64>,
     pub total_duration_ms: i64,
     pub timed_tokens: i64,
+    /// Output from the same positive-duration messages as `total_duration_ms`.
     #[serde(default)]
     pub timed_output_tokens: i64,
+    /// Separate because consumers differ in whether reasoning is additive output.
     #[serde(default)]
     pub timed_reasoning_tokens: i64,
     pub sample_count: i32,
@@ -337,6 +339,7 @@ impl ModelPerformance {
             .saturating_add(tokens.reasoning.max(0));
     }
 
+    /// Total-only samples do not provide output or reasoning attribution.
     pub fn record_message(&mut self, token_total: i64, duration_ms: Option<i64>) {
         let Some(duration_ms) = duration_ms else {
             return;
@@ -9357,9 +9360,97 @@ mod tests {
         let performance = &entries[0].performance;
         assert_eq!(performance.total_duration_ms, 400);
         assert_eq!(performance.timed_tokens, 200);
+        assert_eq!(performance.timed_output_tokens, 50);
+        assert_eq!(performance.timed_reasoning_tokens, 25);
         assert_eq!(performance.sample_count, 1);
         assert_eq!(performance.ms_per_1k_tokens, Some(2000.0));
         assert!((performance.token_coverage - 0.4).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_mixed_timing_output_is_exact_for_session_and_workspace_groups() {
+        let mut timed = make_workspace_message(
+            "antigravity",
+            "gemini-3-flash",
+            "google",
+            "s1",
+            0.1,
+            Some("/repo"),
+            Some("repo"),
+        );
+        timed.tokens = TokenBreakdown {
+            output: 100,
+            reasoning: 20,
+            cache_read: 1000,
+            ..Default::default()
+        };
+        timed.duration_ms = Some(1000);
+        let mut untimed = timed.clone();
+        untimed.duration_ms = None;
+        untimed.tokens = TokenBreakdown {
+            output: 100,
+            reasoning: 80,
+            ..Default::default()
+        };
+        for group in [
+            GroupBy::ClientModel,
+            GroupBy::ClientSession,
+            GroupBy::ClientWorkspaceSession,
+        ] {
+            let entries =
+                aggregate_model_usage_entries(vec![timed.clone(), untimed.clone()], &group);
+            assert_eq!(entries.len(), 1);
+            let entry = &entries[0];
+            assert_eq!(entry.output, 200);
+            assert_eq!(entry.reasoning, 100);
+            assert_eq!(entry.cost, 0.2);
+            assert_eq!(entry.performance.timed_output_tokens, 100);
+            assert_eq!(entry.performance.timed_reasoning_tokens, 20);
+            assert_eq!(entry.performance.total_duration_ms, 1000);
+            let json = serde_json::to_value(&entry.performance).unwrap();
+            assert_eq!(json["timedOutputTokens"], 100);
+            assert_eq!(json["timedReasoningTokens"], 20);
+            assert!(json.get("timed_output_tokens").is_none());
+        }
+    }
+
+    #[test]
+    fn test_timed_buckets_reject_invalid_durations_and_saturate() {
+        let tokens = TokenBreakdown {
+            output: 100,
+            reasoning: 20,
+            ..Default::default()
+        };
+        let mut performance = super::ModelPerformance::default();
+        for duration in [None, Some(0), Some(-1)] {
+            performance.record_token_breakdown(&tokens, duration);
+        }
+        performance.record_token_breakdown(&TokenBreakdown::default(), Some(1000));
+        assert_eq!(performance, super::ModelPerformance::default());
+        performance.record_token_breakdown(
+            &TokenBreakdown {
+                input: 10,
+                output: -100,
+                reasoning: -20,
+                ..Default::default()
+            },
+            Some(1000),
+        );
+        assert_eq!(performance.timed_output_tokens, 0);
+        assert_eq!(performance.timed_reasoning_tokens, 0);
+        assert_eq!(performance.total_duration_ms, 1000);
+        let large = TokenBreakdown {
+            output: i64::MAX,
+            reasoning: i64::MAX,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            performance.record_token_breakdown(&large, Some(i64::MAX));
+        }
+        assert_eq!(performance.timed_output_tokens, i64::MAX);
+        assert_eq!(performance.timed_reasoning_tokens, i64::MAX);
+        assert_eq!(performance.timed_tokens, i64::MAX);
+        assert_eq!(performance.total_duration_ms, i64::MAX);
     }
 
     #[test]
