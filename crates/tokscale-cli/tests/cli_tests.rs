@@ -7041,6 +7041,55 @@ fn create_bucket_timezone_fixture_dir() -> TempDir {
     tmp
 }
 
+#[test]
+fn test_json_home_calendar_override_rebuckets_warm_data_and_preserves_profile() {
+    let tmp = create_bucket_timezone_fixture_dir();
+    let base = tmp.path();
+    let settings = r#"{"scanner":{"bucketTimezone":"UTC"}}"#;
+    write_explicit_home_settings_json(base, settings);
+    let settings_path = if cfg!(windows) {
+        base.join("AppData/Roaming/tokscale/settings.json")
+    } else {
+        base.join(".config/tokscale/settings.json")
+    };
+    let report = |zone: Option<&str>| {
+        let mut cmd = cmd_with_home(base);
+        cmd.args([
+            "--json",
+            "--client",
+            "opencode",
+            "--since",
+            "2026-03-03",
+            "--until",
+            "2026-03-03",
+            "--no-spinner",
+            "--home",
+        ])
+        .arg(base);
+        if let Some(zone) = zone {
+            cmd.args(["--bucket-timezone", zone]);
+        }
+        let bytes = cmd.assert().success().get_output().stdout.clone();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+    };
+    let ordinary = report(None);
+    assert_eq!(ordinary["totalInput"], 0);
+    assert!(ordinary.get("reportCalendar").is_none());
+    let aligned = report(Some("Asia/Seoul"));
+    assert_eq!(aligned["totalInput"], 1000);
+    let proof = &aligned["reportCalendar"];
+    assert_eq!(proof["version"], 1);
+    assert_eq!(proof["timeZone"], "Asia/Seoul");
+    assert_eq!(proof["since"], "2026-03-03");
+    assert_eq!(proof["until"], "2026-03-03");
+    assert_eq!(proof["bucketDate"].as_str().unwrap().len(), 10);
+    assert_eq!(fs::read_to_string(&settings_path).unwrap(), settings);
+    assert_eq!(report(None)["totalInput"], 0);
+    fs::remove_file(&settings_path).unwrap();
+    assert_eq!(report(Some("Asia/Seoul"))["totalInput"], 1000);
+    assert!(!settings_path.exists(), "override must not auto-pin a profile");
+}
+
 fn pin_bucket_timezone(base: &Path, zone: &str) {
     pin_bucket_timezone_field(base, &format!(r#""{zone}""#));
 }

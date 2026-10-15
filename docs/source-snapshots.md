@@ -1,5 +1,13 @@
 # Source snapshot export
 
+## Cross-home report calendar
+
+`--json --home <path> --bucket-timezone <IANA>` (also `models --json`) opts a model report into a caller-selected accounting calendar. The override applies to both native bucketing and date selection, only in memory; it does not change the target profile's timezone or perform startup's automatic pin write. Invalid names and unsupported command combinations (including graph, TUI, light, hide-zero and year reports) fail before startup mutations. Ordinary reports without this flag retain the target profile's existing settings and output.
+
+Opt-in reports add `reportCalendar: { version: 1, timeZone, bucketDate, since, until }`, where dates and zone come from the resolved report context used by the scanner. `since`/`until` are inclusive date keys or null. A collector can validate all three serial reports against one fixed host day/month before combining multiple homes, rejecting a midnight transition or an unsupported binary rather than relabeling counters. This report proof does not grant source-snapshot replacement authority and does not repair existing archived days.
+
+## Source accounting contract
+
 `tokscale graph --source-snapshots --no-spinner` adds the following v2 accounting evidence. Ordinary graph, report, submission and recovery output remain unchanged; submission/recovery payloads never contain `sourceUsage`. The opt-in v1 daily snapshot shape is superseded, not emitted beside v2.
 
 ```ts

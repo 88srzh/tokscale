@@ -84,6 +84,14 @@ struct Cli {
     )]
     home: Option<String>,
 
+    #[arg(
+        long,
+        global = true,
+        value_name = "IANA",
+        help = "Use this calendar for a --json --home model report without changing profile settings"
+    )]
+    bucket_timezone: Option<String>,
+
     #[arg(long, help = "Show processing time")]
     benchmark: bool,
 
@@ -631,10 +639,39 @@ enum HindsightSubcommand {
     },
 }
 
+// The override is deliberately report-only. In particular it must not reach
+// config mutation, TUI caches, graph exports or startup's automatic pin write.
+fn validate_report_timezone_override(cli: &Cli) -> Result<()> {
+    let Some(zone) = &cli.bucket_timezone else {
+        return Ok(());
+    };
+    let supported = match &cli.command {
+        None => cli.json && !cli.light && !cli.hide_zero && cli.date.year.is_none(),
+        Some(Commands::Models {
+            json,
+            light,
+            hide_zero,
+            date,
+            ..
+        }) => *json && !*light && !*hide_zero && date.year.is_none(),
+        _ => false,
+    };
+    anyhow::ensure!(
+        supported && cli.home.is_some() && !cli.test_data,
+        "--bucket-timezone requires a --json --home model report without --year"
+    );
+    anyhow::ensure!(
+        tokscale_core::BucketTimezone::from_pinned_name(Some(zone)).is_pinned(),
+        "--bucket-timezone must be a valid IANA timezone"
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     use std::io::IsTerminal;
 
     let cli = token_monitor::parse_cli(std::env::args_os());
+    validate_report_timezone_override(&cli)?;
     // Install user-configured model aliases once, before any report/graph/TUI
     // path runs, so model-name variants fold consistently across every command.
     // Honors the global `--home` override exactly like scanner settings; an
@@ -655,7 +692,7 @@ fn main() -> Result<()> {
             subcommand: ConfigSubcommand::Set { .. } | ConfigSubcommand::Unset { .. }
         })
     );
-    if !config_mutates_timezone {
+    if !config_mutates_timezone && cli.bucket_timezone.is_none() {
         tui::settings::pin_bucket_timezone_if_unset(&cli.home);
     }
     tokscale_core::model_alias::set_global(&tui::settings::load_model_aliases_for_home(&cli.home));
@@ -694,6 +731,7 @@ fn main() -> Result<()> {
                 run_models_report(
                     json,
                     cli.home.clone(),
+                    cli.bucket_timezone.clone(),
                     clients,
                     &date,
                     benchmark,
@@ -1035,6 +1073,7 @@ fn main() -> Result<()> {
                 run_models_report(
                     cli.json,
                     cli.home.clone(),
+                    cli.bucket_timezone.clone(),
                     clients,
                     &cli.date,
                     cli.benchmark,
@@ -1049,6 +1088,7 @@ fn main() -> Result<()> {
                 run_models_report(
                     false,
                     cli.home.clone(),
+                    cli.bucket_timezone.clone(),
                     clients,
                     &cli.date,
                     cli.benchmark,
@@ -2115,6 +2155,7 @@ impl Drop for LightSpinner {
 /// settings instead of reading the profile again, so filtering and scanning
 /// cannot disagree after a settings change.
 struct ResolvedReportDate {
+    bucket_date: chrono::NaiveDate,
     since: Option<String>,
     until: Option<String>,
     year: Option<String>,
@@ -2132,6 +2173,20 @@ impl ResolvedReportDate {
         Self::from_current_date(date, scanner_settings, current_date)
     }
 
+    fn with_timezone(
+        date: &DateRangeFlags,
+        home_dir: &Option<String>,
+        timezone: &str,
+    ) -> Result<Self> {
+        let zone = tokscale_core::BucketTimezone::from_pinned_name(Some(timezone));
+        let Some(name) = zone.pinned_name() else {
+            anyhow::bail!("--bucket-timezone must be a valid IANA timezone");
+        };
+        let mut settings = tui::settings::load_scanner_settings_for_home(home_dir);
+        settings.bucket_timezone = Some(name.to_string());
+        Ok(Self::from_current_date(date, settings, zone.today()))
+    }
+
     fn from_current_date(
         date: &DateRangeFlags,
         scanner_settings: tokscale_core::ScannerSettings,
@@ -2142,6 +2197,7 @@ impl ResolvedReportDate {
         let date_range = get_date_range_label_for_date(date, current_date);
 
         Self {
+            bucket_date: current_date,
             since,
             until,
             year,
@@ -2157,6 +2213,7 @@ impl ResolvedReportDate {
 /// sync. A failed sync must still be reported as "using cached data" when a
 /// cache existed before the sync attempt.
 struct LocalReportContext {
+    bucket_date: chrono::NaiveDate,
     home_dir: Option<String>,
     clients: Option<Vec<String>>,
     since: Option<String>,
@@ -2181,6 +2238,15 @@ impl LocalReportContext {
         spinner_message: Option<&'static str>,
     ) -> Self {
         let resolved_date = ResolvedReportDate::new(date, &home_dir);
+        Self::from_resolved(home_dir, clients, resolved_date, spinner_message)
+    }
+
+    fn from_resolved(
+        home_dir: Option<String>,
+        clients: Option<Vec<String>>,
+        resolved_date: ResolvedReportDate,
+        spinner_message: Option<&'static str>,
+    ) -> Self {
         let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
         let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
         let spinner = spinner_message.map(LightSpinner::start);
@@ -2189,6 +2255,7 @@ impl LocalReportContext {
         let use_env_roots = use_env_roots(&home_dir);
 
         Self {
+            bucket_date: resolved_date.bucket_date,
             home_dir,
             clients,
             since: resolved_date.since,
@@ -2260,6 +2327,7 @@ fn worktree_rollup_from_flag(merge_worktrees: bool) -> tokscale_core::WorktreeRo
 fn run_models_report(
     json: bool,
     home_dir: Option<String>,
+    bucket_timezone: Option<String>,
     clients: Option<Vec<String>>,
     date: &DateRangeFlags,
     benchmark: bool,
@@ -2273,10 +2341,14 @@ fn run_models_report(
     use tokio::runtime::Runtime;
     use tokscale_core::{get_model_report, GroupBy};
 
-    let mut context = LocalReportContext::new(
+    let resolved_date = match &bucket_timezone {
+        Some(zone) => ResolvedReportDate::with_timezone(date, &home_dir, zone)?,
+        None => ResolvedReportDate::new(date, &home_dir),
+    };
+    let mut context = LocalReportContext::from_resolved(
         home_dir,
         clients,
-        date,
+        resolved_date,
         (!no_spinner).then_some("Scanning session data..."),
     );
     let rt = Runtime::new()?;
@@ -2377,6 +2449,8 @@ fn run_models_report(
         #[derive(serde::Serialize)]
         #[serde(rename_all = "camelCase")]
         struct ModelReportJson {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            report_calendar: Option<serde_json::Value>,
             group_by: String,
             entries: Vec<ModelUsageJson>,
             /// Per-session facts for session-grouped reports, joined by
@@ -2422,6 +2496,15 @@ fn run_models_report(
             })
             .collect();
         let output = ModelReportJson {
+            report_calendar: bucket_timezone.as_ref().map(|_| {
+                serde_json::json!({
+                    "version": 1,
+                    "bucketDate": context.bucket_date.to_string(),
+                    "timeZone": context.scanner_settings.bucket_timezone,
+                    "since": context.since,
+                    "until": context.until,
+                })
+            }),
             group_by: group_by.to_string(),
             sessions,
             workspaces,
@@ -7508,6 +7591,76 @@ mod tests {
         calculate_summary, calculate_years, ClientContribution, DailyContribution, DailyTotals,
         GraphMeta, GraphResult, TokenBreakdown,
     };
+
+    #[test]
+    fn calendar_override_rejects_commands_without_a_model_json_home_report() {
+        for args in [
+            vec!["tokscale", "--json"],
+            vec!["tokscale", "--home", "fixture"],
+            vec!["tokscale", "graph", "--home", "fixture"],
+            vec!["tokscale", "--json", "--home", "fixture", "--year", "2026"],
+        ] {
+            let mut args = args;
+            args.extend(["--bucket-timezone", "UTC"]);
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(validate_report_timezone_override(&cli).is_err());
+        }
+        for args in [
+            vec!["tokscale", "--json", "--home", "fixture"],
+            vec!["tokscale", "models", "--json", "--home", "fixture"],
+        ] {
+            let mut args = args;
+            args.extend(["--bucket-timezone", "UTC"]);
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(validate_report_timezone_override(&cli).is_ok());
+        }
+        let cli = Cli::try_parse_from([
+            "tokscale",
+            "--json",
+            "--home",
+            "fixture",
+            "--bucket-timezone",
+            "bad/zone",
+        ])
+        .unwrap();
+        assert!(validate_report_timezone_override(&cli).is_err());
+    }
+
+    #[test]
+    fn calendar_override_resolves_filter_and_scanner_without_writing_the_profile() {
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join(if cfg!(windows) {
+            "AppData/Roaming/tokscale"
+        } else {
+            ".config/tokscale"
+        });
+        std::fs::create_dir_all(&config).unwrap();
+        let path = config.join("settings.json");
+        let original = r#"{"scanner":{"bucketTimezone":"Pacific/Niue"}}"#;
+        std::fs::write(&path, original).unwrap();
+        let home = Some(home.path().to_string_lossy().into_owned());
+        let date = DateRangeFlags {
+            today: true,
+            ..DateRangeFlags::default()
+        };
+        let resolved =
+            ResolvedReportDate::with_timezone(&date, &home, "Pacific/Kiritimati").unwrap();
+        assert_eq!(
+            resolved.scanner_settings.bucket_timezone.as_deref(),
+            Some("Pacific/Kiritimati")
+        );
+        assert_eq!(resolved.since, Some(resolved.bucket_date.to_string()));
+        assert_eq!(resolved.until, resolved.since);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        assert!(ResolvedReportDate::with_timezone(&date, &home, "bad/zone").is_err());
+        assert_eq!(
+            ResolvedReportDate::new(&date, &home)
+                .scanner_settings
+                .bucket_timezone
+                .as_deref(),
+            Some("Pacific/Niue")
+        );
+    }
 
     /// The overwhelming majority of the pricing sheet is at or above a cent
     /// per 1M tokens, and that output must not move.
