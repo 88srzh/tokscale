@@ -8006,7 +8006,10 @@ fn test_graph_source_snapshots_v2_contract_timestamp_projection_and_default_outp
         cmd_with_home(tmp.path())
             .args([command, "--source-snapshots", "--no-spinner"])
             .assert()
-            .failure();
+            .code(2)
+            .stderr(predicate::str::contains(
+                "unexpected argument '--source-snapshots'",
+            ));
     }
     let mut window_args = vec!["--client", "opencode", "--since", "2026-03-04"];
     for _ in 0..2 {
