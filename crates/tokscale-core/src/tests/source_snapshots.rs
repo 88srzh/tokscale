@@ -495,12 +495,25 @@ fn source_snapshots_are_absent_without_opt_in() {
     }
 }
 
+fn codex_source_fixture_pricing() -> pricing::PricingService {
+    let mut rates = HashMap::new();
+    rates.insert(
+        "gpt-5.4".to_string(),
+        pricing::ModelPricing {
+            input_cost_per_token: Some(0.000001),
+            ..Default::default()
+        },
+    );
+    pricing::PricingService::new(rates, HashMap::new())
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn source_snapshots_codex_mtime_fallback_cannot_authorize_date_replacement() {
     let cache_home = tempfile::TempDir::new().unwrap();
     let source_home = tempfile::TempDir::new().unwrap();
     let _env = redirect_cache_home(cache_home.path());
+    let pricing = codex_source_fixture_pricing();
     let directory = source_home.path().join(".codex/sessions");
     std::fs::create_dir_all(&directory).unwrap();
     let file = directory.join("rollout-2026-03-02-upstream.jsonl");
@@ -532,12 +545,17 @@ async fn source_snapshots_codex_mtime_fallback_cannot_authorize_date_replacement
                 },
                 ..selected(&["codex"])
             },
-            None,
+            Some(&pricing),
             GraphPricingRequirement::LenientSourceSnapshots,
         )
         .await
         .unwrap();
-        assert_eq!(report.source_usage.unwrap().scopes[0].read_status, expected);
+        let source = report.source_usage.unwrap();
+        assert_eq!(source.scopes[0].read_status, expected);
+        assert_eq!(
+            source.scopes[0].reason,
+            (expected == "partial").then_some("source discovery, parse or stable-read check failed")
+        );
     }
 }
 
@@ -548,6 +566,7 @@ async fn source_snapshots_codex_missing_symlink_target_is_partial() {
     let cache_home = tempfile::TempDir::new().unwrap();
     let source_home = tempfile::TempDir::new().unwrap();
     let _env = redirect_cache_home(cache_home.path());
+    let pricing = codex_source_fixture_pricing();
     let directory = source_home.path().join(".codex/sessions");
     std::fs::create_dir_all(&directory).unwrap();
     let target = source_home.path().join("target.jsonl");
@@ -568,12 +587,17 @@ async fn source_snapshots_codex_missing_symlink_target_is_partial() {
                 },
                 ..selected(&["codex"])
             },
-            None,
+            Some(&pricing),
             GraphPricingRequirement::LenientSourceSnapshots,
         )
         .await
         .unwrap();
-        assert_eq!(report.source_usage.unwrap().scopes[0].read_status, expected);
+        let source = report.source_usage.unwrap();
+        assert_eq!(source.scopes[0].read_status, expected);
+        assert_eq!(
+            source.scopes[0].reason,
+            (expected == "partial").then_some("source discovery, parse or stable-read check failed")
+        );
         if expected == "complete" {
             std::fs::remove_file(&target).unwrap();
         }

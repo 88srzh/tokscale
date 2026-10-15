@@ -7761,9 +7761,30 @@ fn test_codex_compressed_session_reports_usage() {
     assert_eq!(json["totalMessages"].as_i64().unwrap(), 1);
 }
 
+fn prime_source_snapshot_pricing_cache(base: &Path) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs();
+    // Read-health fixtures need independent cost evidence before they can
+    // authorize replacement. Keep these rates local and deterministic.
+    let rates = serde_json::json!({
+        "input_cost_per_token": 0.000001,
+        "output_cost_per_token": 0.000002,
+        "cache_read_input_token_cost": 0.0000005,
+        "cache_creation_input_token_cost": 0.00000125,
+    });
+    let payload = serde_json::json!({
+        "timestamp": now,
+        "data": {"gpt-5.4": rates.clone(), "claude-sonnet-4": rates},
+    })
+    .to_string();
+    write_canonical_pricing_cache_files(base, &payload, &payload, &payload);
+}
+
 fn source_snapshot_fixture() -> TempDir {
     let tmp = TempDir::new().unwrap();
-    prime_pricing_cache(tmp.path());
+    prime_source_snapshot_pricing_cache(tmp.path());
     pin_bucket_timezone(tmp.path(), "Pacific/Kiritimati");
     let dir = tmp
         .path()
@@ -8076,6 +8097,36 @@ fn codex_snapshot_fixture(
     }
     fs::write(&path, data).unwrap();
     path
+}
+
+#[test]
+fn test_graph_source_snapshots_codex_unpriced_usage_stays_partial_until_pricing_recovers() {
+    let tmp = source_snapshot_fixture();
+    codex_snapshot_fixture(tmp.path(), 45, false, true);
+    // The generic catalog deliberately does not cover this Codex model.
+    prime_pricing_cache(tmp.path());
+    let unpriced = snapshot_export(tmp.path(), &["--client", "codex"]);
+    assert_eq!(source_tokens(&unpriced["sourceUsage"]), 45);
+    assert_eq!(only_scope(&unpriced)["readStatus"], "partial");
+    assert_eq!(only_scope(&unpriced)["identityStatus"], "exact");
+    assert_eq!(
+        only_scope(&unpriced)["reason"],
+        "source cost evidence is unavailable"
+    );
+    let id = source_events(&unpriced["sourceUsage"]).next().unwrap()["id"].clone();
+
+    prime_source_snapshot_pricing_cache(tmp.path());
+    let priced = snapshot_export(tmp.path(), &["--client", "codex"]);
+    assert_eq!(source_tokens(&priced["sourceUsage"]), 45);
+    assert_eq!(only_scope(&priced)["readStatus"], "complete");
+    assert_eq!(only_scope(&priced)["identityStatus"], "exact");
+    let event = source_events(&priced["sourceUsage"]).next().unwrap();
+    assert_eq!(event["id"], id);
+    assert!(event["contributions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|row| row["cost"].as_f64().unwrap() > 0.0));
 }
 
 #[test]
