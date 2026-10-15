@@ -3,7 +3,7 @@ use crate::{
     bucket_tz::BucketTimezone,
     source_snapshot::{source_event_id, source_scope_id, SourceReadEvidence},
 };
-use crate::{SourceEventUsage, SourceUsage};
+use crate::{has_source_cost_evidence, SourceEventUsage, SourceUsage};
 use std::time::Instant;
 
 fn message(
@@ -31,7 +31,63 @@ fn message(
     );
     message.date = date.into();
     message.dedup_key = key.map(str::to_string);
+    // This fixture supplies an explicit cost. Price-outage tests below clear
+    // that provenance to exercise the export-only replacement gate.
+    message.mark_provider_reported_cost();
     message
+}
+
+#[test]
+fn source_snapshots_unknown_cost_is_partial_but_reported_zero_is_complete() {
+    let options = selected(&["micode", "micode-desktop"]);
+    let mut unknown = message("micode", "same", "2026-03-01", "unlisted", 15, Some("event"));
+    unknown.cost = 0.0;
+    unknown.cost_source = sessions::CostSource::Unknown;
+    let graph = snapshot(
+        &options,
+        vec![unknown.clone()],
+        Some(SourceReadEvidence::new("micode", true, true)),
+    );
+    let source = graph.source_usage.unwrap();
+    assert_eq!(source.scopes[0].read_status, "partial");
+    assert_eq!(source.scopes[0].identity_status, "exact");
+    assert_eq!(source.scopes[0].reason, Some("source cost evidence is unavailable"));
+    assert_eq!(source.sessions[0].events[0].contributions[0].cost, 0.0);
+    assert_eq!(tokens(&source.sessions[0].events[0]), 15);
+
+    unknown.mark_provider_reported_cost();
+    let reported = snapshot(
+        &options,
+        vec![unknown],
+        Some(SourceReadEvidence::new("micode", true, true)),
+    );
+    assert_eq!(reported.source_usage.unwrap().scopes[0].read_status, "complete");
+}
+
+#[test]
+fn source_cost_evidence_requires_covered_buckets_and_accepts_explicit_free_rates() {
+    let mut rates = HashMap::new();
+    rates.insert(
+        "covered-model".to_string(),
+        pricing::ModelPricing {
+            input_cost_per_token: Some(0.0),
+            ..Default::default()
+        },
+    );
+    let pricing = pricing::PricingService::new(rates, HashMap::new());
+    let mut row = message("codex", "same", "2026-03-01", "covered-model", 15, None);
+    row.cost = 0.0;
+    row.cost_source = sessions::CostSource::Unknown;
+    assert!(!has_source_cost_evidence(&row, None));
+    assert!(has_source_cost_evidence(&row, Some(&pricing)));
+    row.tokens.output = 1;
+    assert!(!has_source_cost_evidence(&row, Some(&pricing)));
+    row.model_id = "unlisted".into();
+    assert!(!has_source_cost_evidence(&row, Some(&pricing)));
+    row.mark_provider_reported_cost();
+    assert!(has_source_cost_evidence(&row, None));
+    row.cost = f64::NAN;
+    assert!(!has_source_cost_evidence(&row, Some(&pricing)));
 }
 
 fn snapshot(

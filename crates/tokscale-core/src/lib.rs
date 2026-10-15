@@ -5572,6 +5572,23 @@ fn has_source_session_identity(message: &UnifiedMessage) -> bool {
         && !(message.client == "copilot" && message.session_id == "unknown-session")
 }
 
+fn has_source_cost_evidence(
+    message: &UnifiedMessage,
+    pricing: Option<&pricing::PricingService>,
+) -> bool {
+    message.cost.is_finite()
+        && message.cost >= 0.0
+        && (message.has_authoritative_cost()
+            || (!has_positive_token_usage(&message.tokens) && message.cost == 0.0)
+            || pricing.is_some_and(|pricing| {
+                pricing.covers_usage_with_provider(
+                    &message.model_id,
+                    Some(&message.provider_id),
+                    &message.tokens,
+                )
+            }))
+}
+
 impl MessageSink for GraphSink<'_> {
     fn wants_source_evidence(&self) -> bool {
         self.source_usage.is_some()
@@ -5618,6 +5635,7 @@ impl MessageSink for GraphSink<'_> {
             scope.unresolved_rows |= source_event_id(&message).is_none()
                 || !has_source_session_identity(&message)
                 || message.timestamp <= 0;
+            scope.unpriced_rows |= !has_source_cost_evidence(&message, self.pricing);
         }
         if let (Some(source_usage), Some(sessions)) =
             (&mut self.source_usage, &mut self.source_daily)

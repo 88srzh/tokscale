@@ -184,6 +184,7 @@ impl SourceReadEvidence {
 pub(crate) struct SourceScopeFold {
     pub clients: BTreeSet<String>,
     pub unresolved_rows: bool,
+    pub unpriced_rows: bool,
     evidence: Option<(bool, bool)>,
 }
 impl SourceScopeFold {
@@ -230,7 +231,12 @@ impl SourceScopeFold {
             },
             reason: None,
         };
-        if !scope_has_selection_coverage(&scope, selected) {
+        if self.unpriced_rows {
+            // Numeric zero alone is not pricing evidence. Keep the lenient
+            // graph visible, but do not authorize durable accounting replacement.
+            scope.read_status = "partial";
+            scope.reason = Some("source cost evidence is unavailable");
+        } else if !scope_has_selection_coverage(&scope, selected) {
             scope.read_status = "partial";
             scope.reason = Some("client selection does not cover the scanner dedup domain");
         } else if scope.read_status == "unknown" {
