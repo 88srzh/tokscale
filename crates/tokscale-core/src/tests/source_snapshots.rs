@@ -554,7 +554,8 @@ async fn source_snapshots_codex_mtime_fallback_cannot_authorize_date_replacement
         assert_eq!(source.scopes[0].read_status, expected);
         assert_eq!(
             source.scopes[0].reason,
-            (expected == "partial").then_some("source discovery, parse or stable-read check failed")
+            (expected == "partial")
+                .then_some("source discovery, parse or stable-read check failed")
         );
     }
 }
@@ -596,7 +597,8 @@ async fn source_snapshots_codex_missing_symlink_target_is_partial() {
         assert_eq!(source.scopes[0].read_status, expected);
         assert_eq!(
             source.scopes[0].reason,
-            (expected == "partial").then_some("source discovery, parse or stable-read check failed")
+            (expected == "partial")
+                .then_some("source discovery, parse or stable-read check failed")
         );
         if expected == "complete" {
             std::fs::remove_file(&target).unwrap();
