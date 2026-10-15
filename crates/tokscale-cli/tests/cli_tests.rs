@@ -7087,7 +7087,10 @@ fn test_json_home_calendar_override_rebuckets_warm_data_and_preserves_profile() 
     assert_eq!(report(None)["totalInput"], 0);
     fs::remove_file(&settings_path).unwrap();
     assert_eq!(report(Some("Asia/Seoul"))["totalInput"], 1000);
-    assert!(!settings_path.exists(), "override must not auto-pin a profile");
+    assert!(
+        !settings_path.exists(),
+        "override must not auto-pin a profile"
+    );
 }
 
 fn pin_bucket_timezone(base: &Path, zone: &str) {
