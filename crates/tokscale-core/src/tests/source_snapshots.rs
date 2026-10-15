@@ -40,7 +40,14 @@ fn message(
 #[test]
 fn source_snapshots_unknown_cost_is_partial_but_reported_zero_is_complete() {
     let options = selected(&["micode", "micode-desktop"]);
-    let mut unknown = message("micode", "same", "2026-03-01", "unlisted", 15, Some("event"));
+    let mut unknown = message(
+        "micode",
+        "same",
+        "2026-03-01",
+        "unlisted",
+        15,
+        Some("event"),
+    );
     unknown.cost = 0.0;
     unknown.cost_source = sessions::CostSource::Unknown;
     let graph = snapshot(
@@ -51,7 +58,10 @@ fn source_snapshots_unknown_cost_is_partial_but_reported_zero_is_complete() {
     let source = graph.source_usage.unwrap();
     assert_eq!(source.scopes[0].read_status, "partial");
     assert_eq!(source.scopes[0].identity_status, "exact");
-    assert_eq!(source.scopes[0].reason, Some("source cost evidence is unavailable"));
+    assert_eq!(
+        source.scopes[0].reason,
+        Some("source cost evidence is unavailable")
+    );
     assert_eq!(source.sessions[0].events[0].contributions[0].cost, 0.0);
     assert_eq!(tokens(&source.sessions[0].events[0]), 15);
 
@@ -61,7 +71,10 @@ fn source_snapshots_unknown_cost_is_partial_but_reported_zero_is_complete() {
         vec![unknown],
         Some(SourceReadEvidence::new("micode", true, true)),
     );
-    assert_eq!(reported.source_usage.unwrap().scopes[0].read_status, "complete");
+    assert_eq!(
+        reported.source_usage.unwrap().scopes[0].read_status,
+        "complete"
+    );
 }
 
 #[test]
