@@ -313,11 +313,30 @@ pub struct ModelPerformance {
     pub ms_per_1k_tokens: Option<f64>,
     pub total_duration_ms: i64,
     pub timed_tokens: i64,
+    #[serde(default)]
+    pub timed_output_tokens: i64,
+    #[serde(default)]
+    pub timed_reasoning_tokens: i64,
     pub sample_count: i32,
     pub token_coverage: f64,
 }
 
 impl ModelPerformance {
+    /// Keep the exact output buckets paired with the accepted timing samples.
+    pub fn record_token_breakdown(&mut self, tokens: &TokenBreakdown, duration_ms: Option<i64>) {
+        let total = positive_token_total(tokens);
+        if duration_ms.is_none_or(|duration| duration <= 0) || total <= 0 {
+            return;
+        }
+        self.record_message(total, duration_ms);
+        self.timed_output_tokens = self
+            .timed_output_tokens
+            .saturating_add(tokens.output.max(0));
+        self.timed_reasoning_tokens = self
+            .timed_reasoning_tokens
+            .saturating_add(tokens.reasoning.max(0));
+    }
+
     pub fn record_message(&mut self, token_total: i64, duration_ms: Option<i64>) {
         let Some(duration_ms) = duration_ms else {
             return;
@@ -378,6 +397,7 @@ pub struct ParsedMessage {
     pub cache_write_1h: i64,
     pub reasoning: i64,
     pub duration_ms: Option<i64>,
+    pub performance_timing: Option<sessions::PerformanceTiming>,
     pub message_count: i32,
     pub agent: Option<String>,
     /// Cost in USD as the parser reported it. This lane applies no pricing, so
@@ -4650,7 +4670,7 @@ fn aggregate_model_usage_entries_with_labeler(
         entry.cost += msg.cost;
         entry
             .performance
-            .record_message(positive_token_total(&msg.tokens), msg.duration_ms);
+            .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
     }
 
     let mut entries: Vec<ModelUsage> = model_map
@@ -7304,6 +7324,7 @@ fn unified_to_parsed(msg: &UnifiedMessage) -> ParsedMessage {
         cache_write_1h: msg.tokens.cache_write_1h,
         reasoning: msg.tokens.reasoning,
         duration_ms: msg.duration_ms,
+        performance_timing: msg.performance_timing,
         message_count: msg.message_count,
         agent: msg.agent.clone(),
         cost: msg.cost,
@@ -7444,6 +7465,7 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
         cost_source: CostSource::Unknown,
         service_tier: msg.service_tier.clone(),
         duration_ms: msg.duration_ms,
+        performance_timing: msg.performance_timing,
         message_count: msg.message_count,
         agent: msg.agent.clone(),
         dedup_key: None,

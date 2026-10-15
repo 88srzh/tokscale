@@ -4279,6 +4279,12 @@ fn aggregate_model_report_performance(
         performance.timed_tokens = performance
             .timed_tokens
             .saturating_add(entry.performance.timed_tokens);
+        performance.timed_output_tokens = performance
+            .timed_output_tokens
+            .saturating_add(entry.performance.timed_output_tokens);
+        performance.timed_reasoning_tokens = performance
+            .timed_reasoning_tokens
+            .saturating_add(entry.performance.timed_reasoning_tokens);
         performance.sample_count = performance
             .sample_count
             .saturating_add(entry.performance.sample_count);

@@ -494,6 +494,7 @@ fn is_codex_chat_workspace(key: &str) -> bool {
     !Path::new(key).join(".git").exists()
 }
 
+#[cfg(test)]
 fn positive_unified_token_total(tokens: &tokscale_core::TokenBreakdown) -> i64 {
     // saturating_add (mirrors tokscale_core::TokenBreakdown::total) so a
     // clamped (i64::MAX) bucket from a corrupt source can't overflow the
@@ -958,7 +959,7 @@ impl DataLoader {
             model_entry.cost += msg_cost;
             model_entry
                 .performance
-                .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
+                .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
 
             if let Some(date) = parse_date(&msg.date) {
                 let model_day = model_days
@@ -998,7 +999,7 @@ impl DataLoader {
                     .saturating_add(msg.message_count.max(0) as u64);
                 model_day
                     .performance
-                    .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
+                    .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
             }
 
             // A recovered daily floor has a synthetic session id; it adds usage
@@ -1186,7 +1187,7 @@ impl DataLoader {
                     .saturating_add(msg.message_count.max(0) as u64);
                 model_info
                     .performance
-                    .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
+                    .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
             }
 
             // Hourly aggregation: derive hour from timestamp (Unix ms),
@@ -2057,6 +2058,7 @@ mod tests {
             cost_source: tokscale_core::sessions::CostSource::default(),
             service_tier: None,
             duration_ms: None,
+            performance_timing: None,
             message_count: 1,
             agent: Some("hephaestus".to_string()),
             dedup_key: None,
