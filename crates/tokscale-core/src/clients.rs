@@ -1092,6 +1092,17 @@ define_clients!(
         headless: false,
         parse_local: true,
         submit_default: true
+    },
+    Aside = 56 => {
+        id: "aside",
+        display: "Aside",
+        logo: Some("https://raw.githubusercontent.com/junhoyeo/tokscale/main/.github/assets/client-aside.png"),
+        root: PathRoot::Home,
+        relative: ".aside/u",
+        pattern: "messages.jsonl",
+        headless: false,
+        parse_local: true,
+        submit_default: true
     }
 );
 
@@ -1207,7 +1218,7 @@ mod tests {
 
     #[test]
     fn test_client_id_count() {
-        assert_eq!(ClientId::COUNT, 56);
+        assert_eq!(ClientId::COUNT, 57);
     }
 
     #[test]
