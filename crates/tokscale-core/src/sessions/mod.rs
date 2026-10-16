@@ -461,7 +461,7 @@ impl UnifiedMessage {
         self.cost_source = CostSource::ProviderReported;
     }
 
-    pub(crate) fn mark_estimated_cost(&mut self) {
+    pub fn mark_estimated_cost(&mut self) {
         self.cost_source = CostSource::Estimated;
     }
 
