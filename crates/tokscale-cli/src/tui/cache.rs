@@ -21,7 +21,7 @@ use super::data::{
 
 /// Cache staleness threshold: 5 minutes (matches TS implementation)
 const CACHE_STALE_THRESHOLD_MS: u64 = 5 * 60 * 1000;
-const CACHE_SCHEMA_VERSION: u32 = 11;
+const CACHE_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1387,7 +1387,7 @@ mod tests {
             &cache_path,
             with_current_generation(
                 r#"{
-  "schemaVersion": 11,
+  "schemaVersion": 12,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
   "includeSynthetic": false,
@@ -1666,7 +1666,7 @@ mod tests {
             &cache_path,
             with_current_generation(
                 r#"{
-  "schemaVersion": 11,
+  "schemaVersion": 12,
   "timestamp": 9999999999999,
   "enabledClients": ["claude", "cursor"],
   "includeSynthetic": false,
@@ -1915,7 +1915,7 @@ mod tests {
     }
 
     const LEGACY_FALLBACK_PAYLOAD: &str = r#"{
-  "schemaVersion": 11,
+  "schemaVersion": 12,
   "timestamp": 9999999999999,
   "enabledClients": ["claude"],
   "includeSynthetic": false,
