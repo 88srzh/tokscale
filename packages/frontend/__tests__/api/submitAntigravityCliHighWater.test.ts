@@ -792,6 +792,120 @@ describe("POST /api/submit Antigravity family high-water", () => {
     }
   });
 
+  it("freezes a deficit in any single coverage field while every other field still covers", async () => {
+    // The family check compares all seven COVERAGE_FIELDS, not just `tokens`.
+    // A snapshot can therefore carry the SAME token total while losing only
+    // cacheRead, reasoning, or messages, which must still freeze. Driving each
+    // field below its baseline on its own keeps a regression that narrows the
+    // comparison to `tokens` from passing unnoticed.
+    const richCell = (over: Partial<Record<string, number>> = {}) => {
+      const tokenFields = {
+        input: 40_000,
+        output: 30_000,
+        cacheRead: 20_000,
+        cacheWrite: 10_000,
+        reasoning: 20_000,
+        ...over,
+      };
+      return { tokens: tokenFields, messages: over.messages ?? 12 };
+    };
+
+    const bodyFor = (cell: ReturnType<typeof richCell>, generatedAt: string) => ({
+      device: { id: "dev_1", name: "Device one" },
+      meta: {
+        generatedAt,
+        version: "4.13.0",
+        dateRange: { start: "2026-08-07", end: "2026-08-07" },
+      },
+      scanScope: {
+        parserVersions: Object.fromEntries(
+          ANTIGRAVITY_FAMILY.map((source) => [source, 1]),
+        ),
+        fullHistory: true,
+      },
+      summary: { clients: ["antigravity-cli"] },
+      years: [],
+      contributions: [
+        {
+          date: "2026-08-07",
+          clients: [
+            {
+              client: "antigravity-cli",
+              modelId: "gemini-3-pro",
+              tokens: cell.tokens,
+              cost: 120,
+              messages: cell.messages,
+            },
+          ],
+        },
+      ],
+    });
+
+    const baselineCell = richCell();
+    const baselineTokens = Object.values(baselineCell.tokens).reduce(
+      (sum, value) => sum + value,
+      0,
+    );
+
+    // Each case regresses exactly one field while holding the lifetime token
+    // sum at the baseline, so `tokens` alone cannot explain the freeze. The
+    // derived `tokens` total is itself the sum of the five token fields (see
+    // TOKEN_FIELDS in parserHighWater), so it cannot regress on its own and
+    // needs no case of its own.
+    const cases: Array<{ field: string; cell: ReturnType<typeof richCell> }> = [
+      { field: "cacheRead", cell: richCell({ cacheRead: 10_000, output: 40_000 }) },
+      { field: "reasoning", cell: richCell({ reasoning: 10_000, input: 50_000 }) },
+      { field: "cacheWrite", cell: richCell({ cacheWrite: 0, input: 50_000 }) },
+      { field: "input", cell: richCell({ input: 30_000, output: 40_000 }) },
+      { field: "output", cell: richCell({ output: 20_000, input: 50_000 }) },
+      { field: "messages", cell: richCell({ messages: 4 }) },
+    ];
+
+    for (const { field, cell } of cases) {
+      const store = newStore();
+      installTx(store);
+      const first = bodyFor(baselineCell, "2026-08-10T00:00:00Z");
+      mockSubmit(first);
+      expect((await post(first)).status).toBe(200);
+      expect(storedTokens(store)).toBe(baselineTokens);
+
+      installTx(store);
+      const regressed = bodyFor(cell, "2026-09-02T00:00:00Z");
+      mockSubmit(regressed);
+      const response = await post(regressed);
+      expect(response.status).toBe(200);
+      const json = await response.json();
+
+      // Stored history is preserved at the credited baseline for every field.
+      expect(json.metrics.totalTokens, `${field} deficit must not reduce tokens`).toBe(
+        baselineTokens,
+      );
+      expect(storedTokens(store), `${field} deficit must not reduce stored tokens`).toBe(
+        baselineTokens,
+      );
+      const stored = store.days.find((day) => day.date === "2026-08-07")
+        ?.sourceBreakdown["antigravity-cli"];
+      expect(stored?.messages, `${field} deficit must not reduce messages`).toBe(
+        baselineCell.messages,
+      );
+      // Assert EVERY token field, not just the one this case regressed: a
+      // comparator that drops a single field from COVERAGE_FIELDS must fail
+      // here rather than passing because no assertion happened to watch it.
+      for (const tokenField of [
+        "input",
+        "output",
+        "cacheRead",
+        "cacheWrite",
+        "reasoning",
+      ] as const) {
+        expect(
+          stored?.[tokenField],
+          `${field} deficit must not reduce ${tokenField}`,
+        ).toBe(baselineCell.tokens[tokenField]);
+      }
+    }
+  });
+
   it("does not inflate or compound stored tokens when pruned history re-dates forward across adjacent or anchored days", async () => {
     // 1. Adjacent-day walk under deficit: 240,000 on 08-07 followed by a
     // pruned 150,000 block walking across 08-08, 08-09, 08-10 must hold 240,000.
