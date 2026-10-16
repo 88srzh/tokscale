@@ -262,6 +262,8 @@ bun run build:core
 
 ## Usage
 
+Model performance uses observed client-log timing. See [request performance timing](docs/request-performance.md) for timed token buckets, Codex request boundaries and the distinction from session activity time.
+
 ### Basic Commands
 
 ```bash

@@ -513,6 +513,7 @@ mod tests {
             model_attribution_conflicted: false,
             copilot_context: None,
             duration_ms: None,
+            performance_timing: None,
         }
     }
 
