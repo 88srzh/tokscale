@@ -419,7 +419,7 @@ tokscale --client opencode,claude
 # Repeated: same effect, useful with shell aliases
 tokscale -c opencode -c claude
 
-# Cursor IDE uses Tokscale's API cache; run login + sync --json first
+# Cursor IDE uses Tokscale's API cache; a signed-in desktop session is imported when no login is saved
 tokscale --client cursor
 
 # Synthetic (synthetic.new) is detected from other agent sessions
@@ -618,15 +618,15 @@ Scheduled runs are non-interactive: they never prompt for GitHub auth or star co
 
 ### Cursor IDE Commands
 
-Cursor IDE support uses Cursor's web usage API, cached by Tokscale at `~/.config/tokscale/cursor-cache/usage*.json`. Tokscale does not parse local Cursor Agent CLI state under `~/.cursor`, and it does not treat the desktop SQLite DB as a usage ledger.
+Cursor IDE support uses Cursor's usage-events API. Tokscale caches usage at `~/.config/tokscale/cursor-cache/usage.json` for the active account and `usage.account-<sha256-of-exact-account-id>.json` for each other account, with verified ownership metadata. Unmarked legacy JSON/CSV caches are preserved in `cursor-cache/archive/` before sync or an account change; see the migration details below. Tokscale does not parse local Cursor Agent CLI state under `~/.cursor`, and it does not treat the desktop SQLite DB as a usage ledger.
 
-When the Cursor desktop app is installed and signed in, `tokscale cursor login` prefers the local `cursorAuth/accessToken` from Cursor's `state.vscdb` and builds the session cookie automatically. `tokscale cursor sync` also refreshes that token when available. Usage rows still come only from Cursor's usage API.
+When the Cursor desktop app is installed and signed in, reports, submit, and wrapped can import `cursorAuth/accessToken` from `state.vscdb` when no Cursor login is saved yet. Wrapped only does this when Cursor is included in the requested clients. Reports skip syncing while the usage cache is fresh. Whenever a sync runs, including explicit `tokscale cursor sync`, it refreshes the desktop token when available and can switch the active account to that desktop login. A saved login remains usable when no desktop session is available. Usage rows still come only from Cursor's usage-events API, not from local `~/.cursor` transcripts.
 
 Setup (desktop auto-login):
 
 1. Sign in to the Cursor desktop app.
-2. Run `tokscale cursor login --name work` (auto-detects the local desktop session when available).
-3. Run `tokscale cursor sync --json` to populate `~/.config/tokscale/cursor-cache/usage.json`.
+2. Optional: run `tokscale cursor login --name work` to save that desktop session under a name. Reports, submit, and sync import it automatically when no Cursor login is saved yet.
+3. Optional: run `tokscale cursor sync --json` to refresh `~/.config/tokscale/cursor-cache/usage.json` now. A report syncs on its own when the cache is stale.
 4. Run `tokscale --client cursor` or any report command.
 
 Fallback (manual browser cookie), if desktop login is unavailable:

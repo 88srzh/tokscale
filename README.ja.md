@@ -421,7 +421,7 @@ tokscale --client opencode,claude
 # 繰り返し：同じ効果（シェルエイリアスと相性が良い）
 tokscale -c opencode -c claude
 
-# Cursor IDE は事前に `tokscale cursor login` が必要
+# Cursor IDE は Tokscale の API キャッシュを使う。保存済みログインがなければデスクトップセッションを取り込む
 tokscale --client cursor
 
 # Synthetic（synthetic.new）は他のエージェントセッションから検出されます
@@ -620,15 +620,15 @@ tokscale autosubmit disable
 
 ### Cursor IDEコマンド
 
-Cursor IDE は Cursor のウェブ使用量 API を使い、Tokscale が `~/.config/tokscale/cursor-cache/usage*.json` にキャッシュします。Tokscale は `~/.cursor` 配下の Cursor Agent CLI ローカル状態を解析しません。また、デスクトップの SQLite DB を使用量台帳としては扱いません。
+Cursor IDE は Cursor の usage-events API を使います。アクティブアカウントは `~/.config/tokscale/cursor-cache/usage.json`、その他のアカウントは `usage.account-<sha256-of-exact-account-id>.json` に所有者メタデータ付きで保存します。所有者を確認できない旧 JSON/CSV は、同期やアカウント変更の前に `cursor-cache/archive/` に保管します。Tokscale は `~/.cursor` 配下のローカル記録を解析せず、デスクトップの SQLite DB を使用量台帳として扱いません。
 
-Cursor デスクトップアプリがインストール済みでサインイン済みの場合、`tokscale cursor login` は Cursor の `state.vscdb` から `cursorAuth/accessToken` を優先して読み取り、セッション Cookie を自動構築します。`tokscale cursor sync` も利用可能ならそのトークンを更新します。使用量行は引き続き Cursor の使用量 API からのみ取得します。
+Cursor デスクトップアプリがインストール済みでサインイン済みの場合、保存済みの Cursor ログインがなければ、レポート、submit、wrapped は `state.vscdb` の `cursorAuth/accessToken` を取り込めます。wrapped は対象クライアントに Cursor が含まれる場合だけ取り込みます。使用量キャッシュが新しい間、レポートは同期をスキップします。明示的な `tokscale cursor sync` を含め、同期が実行されるたびに、利用可能なデスクトップトークンを更新し、そのデスクトップログインへアクティブアカウントを切り替えることがあります。デスクトップセッションがない場合も、保存済みログインは引き続き利用できます。使用量行は Cursor の usage-events API からのみ取得し、ローカルの `~/.cursor` トランスクリプトは解析しません。
 
 セットアップ（デスクトップ自動ログイン）:
 
 1. Cursor デスクトップアプリにサインインする。
-2. `tokscale cursor login --name work` を実行する（ローカルデスクトップセッションがあれば自動検出）。
-3. `tokscale cursor sync --json` を実行して `~/.config/tokscale/cursor-cache/usage.json` を埋める。
+2. 任意: `tokscale cursor login --name work` を実行し、そのデスクトップセッションを名前付きで保存する。保存済みログインがまだないときは、レポート、submit、sync が自動で取り込む。
+3. 任意: `tokscale cursor sync --json` を実行し、`~/.config/tokscale/cursor-cache/usage.json` を今すぐ更新する。キャッシュが古いときはレポート自身が同期する。
 4. `tokscale --client cursor` または任意のレポートコマンドを実行する。
 
 フォールバック（手動でブラウザ Cookie を貼り付け）— デスクトップログインが使えない場合:
@@ -672,9 +672,9 @@ tokscale cursor logout --all
 tokscale cursor logout --all --purge-cache
 ```
 
-**資格情報の保存**: Cursorアカウントは`~/.config/tokscale/cursor-credentials.json`に保存されます。使用量データは`~/.config/tokscale/cursor-cache/`にキャッシュされます（アクティブアカウントは`usage.json`、追加アカウントは`usage.<account>.json`）。
+**資格情報の保存**: Cursorアカウントは`~/.config/tokscale/cursor-credentials.json`に保存されます。使用量データは`~/.config/tokscale/cursor-cache/`にキャッシュされます（アクティブアカウントは`usage.json`、追加アカウントは`usage.account-<sha256-of-exact-account-id>.json`）。
 
-デフォルトでは、tokscale は **保存済みのすべての Cursor アカウントの使用量を合算**します（`cursor-cache/usage*.json`）。以前のバージョンの Tokscale が作成した旧形式の CSV キャッシュ（`usage.csv`、`usage.<account>.csv`）も、まだ JSON キャッシュがないアカウントについては引き続き読み込みます。そのアカウントの次回の同期が成功すると、JSON キャッシュを書き込み、CSV を `cursor-cache/archive/` に移動します。
+デフォルトでは、保存済みの全 Cursor アカウントの `cursor-cache/usage*.json` を合算します。ファイル名は正確なアカウント ID の SHA-256 に基づき、所有者を検証するため、旧サニタイズ名が衝突しても履歴や同期位置を共有しません。所有者を確認できない旧 JSON/CSV は元のバイト列とファイル名のまま `cursor-cache/archive/` 内の一意のディレクトリに保管し、各アカウントを最初から取得します。バックアップはレポート対象外で、取得失敗後も復元可能です。保管に失敗した場合は上書き前に停止します。移行前のオフラインレポートでは旧キャッシュを引き続き読めます。新しい使用量と最新の有効イベントより 1 時間前までの訂正を取得し、それより古い履歴は保持します。タイムアウトした取得は保存せず、既存キャッシュを維持して未取得区間の飛び越しを防ぎます。
 
 ログアウト時はキャッシュされた履歴を `cursor-cache/archive/` に移動して保持します（そのため集計には含まれません）。完全に削除したい場合は `--purge-cache` を使ってください。
 

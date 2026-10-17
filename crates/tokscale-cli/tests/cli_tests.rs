@@ -1659,6 +1659,35 @@ fn write_cursor_usage_cache(base: &Path) {
     .unwrap();
 }
 
+fn write_cursor_desktop_session(base: &Path) {
+    use base64::Engine;
+    let payload =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"auth0|user_DESKTOP"}"#);
+    let token = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+    let relative = if cfg!(target_os = "macos") {
+        "Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+    } else if cfg!(target_os = "windows") {
+        "AppData/Roaming/Cursor/User/globalStorage/state.vscdb"
+    } else {
+        ".config/Cursor/User/globalStorage/state.vscdb"
+    };
+    let path = base.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    connection
+        .execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+            rusqlite::params!["cursorAuth/accessToken", token],
+        )
+        .unwrap();
+}
+
 fn write_cursor_credentials(base: &Path) {
     let config_dir = base.join(".config/tokscale");
     fs::create_dir_all(&config_dir).unwrap();
@@ -3378,12 +3407,146 @@ fn test_graph_cursor_explicit_missing_cache_reports_setup_warning_text() {
 }
 
 #[test]
+fn test_cursor_desktop_session_is_imported_before_graph_and_submit_sync() {
+    for args in [
+        vec!["graph", "--client", "cursor", "--no-spinner"],
+        vec!["--no-spinner", "submit", "--client", "cursor", "--dry-run"],
+    ] {
+        let tmp = create_empty_fixture_dir();
+        write_cursor_desktop_session(tmp.path());
+        let output = cmd_with_home(tmp.path())
+            .env("APPDATA", tmp.path().join("AppData/Roaming"))
+            .env("TOKSCALE_API_TOKEN", "test-token")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        let credentials: serde_json::Value = serde_json::from_slice(
+            &fs::read(tmp.path().join(".config/tokscale/cursor-credentials.json"))
+                .expect("a report must discover the signed-in desktop session without login"),
+        )
+        .unwrap();
+        assert_eq!(credentials["activeAccountId"], "user_DESKTOP");
+        assert!(
+            tmp.path()
+                .join(".config/tokscale/cursor-cache/usage.last-sync-attempt")
+                .exists(),
+            "the imported session must reach sync even though the offline proxy refuses it: {output:?}"
+        );
+
+        // A failed first implicit sync must not repeat on the very next report:
+        // the recorded attempt bounds the retry until freshness expires. An
+        // explicit `submit` keeps syncing because the user asked for it.
+        if args[0] == "graph" {
+            let marker = tmp
+                .path()
+                .join(".config/tokscale/cursor-cache/usage.last-sync-attempt");
+            let first_attempt = fs::metadata(&marker).unwrap().modified().unwrap();
+            let output = cmd_with_home(tmp.path())
+                .env("APPDATA", tmp.path().join("AppData/Roaming"))
+                .args(&args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+            assert_eq!(
+                fs::metadata(&marker).unwrap().modified().unwrap(),
+                first_attempt,
+                "{args:?} retried the failed Cursor sync on the next report"
+            );
+        }
+    }
+}
+
+/// Logout is a durable boundary: a still-signed-in desktop session must not be
+/// re-imported by an ordinary report, and the purged cache must stay gone.
+#[test]
+fn test_cursor_logout_blocks_implicit_desktop_reimport_until_explicit_login() {
+    let tmp = create_empty_fixture_dir();
+    write_cursor_desktop_session(tmp.path());
+    let credentials = tmp.path().join(".config/tokscale/cursor-credentials.json");
+    let cache_dir = tmp.path().join(".config/tokscale/cursor-cache");
+
+    // A first report imports the desktop session, as the feature intends.
+    cmd_with_home(tmp.path())
+        .env("APPDATA", tmp.path().join("AppData/Roaming"))
+        .args(["graph", "--client", "cursor", "--no-spinner"])
+        .assert()
+        .success();
+    assert!(credentials.exists());
+
+    cmd_with_home(tmp.path())
+        .args(["cursor", "logout", "--all", "--purge-cache"])
+        .assert()
+        .success();
+    assert!(!credentials.exists());
+    assert!(!cache_dir.exists());
+
+    for args in [
+        vec!["graph", "--no-spinner"],
+        vec!["graph", "--client", "cursor", "--no-spinner"],
+        vec!["--no-spinner", "submit", "--client", "cursor", "--dry-run"],
+    ] {
+        let output = cmd_with_home(tmp.path())
+            .env("APPDATA", tmp.path().join("AppData/Roaming"))
+            .env("TOKSCALE_API_TOKEN", "test-token")
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {output:?}");
+        assert!(
+            !credentials.exists(),
+            "{args:?} re-imported a desktop session after an explicit logout"
+        );
+        assert!(
+            !cache_dir.join("usage.json").exists(),
+            "{args:?} recovered purged Cursor usage after an explicit logout"
+        );
+    }
+
+    // Only an explicit Cursor command restores discovery.
+    cmd_with_home(tmp.path())
+        .env("APPDATA", tmp.path().join("AppData/Roaming"))
+        .args(["cursor", "sync", "--json", "--timeout", "1"])
+        .assert()
+        .success();
+    assert!(
+        credentials.exists(),
+        "an explicit `cursor sync` must restore desktop discovery"
+    );
+}
+
+#[test]
+fn test_cursor_desktop_session_is_not_imported_for_excluded_or_external_reports() {
+    for external in [false, true] {
+        let tmp = create_empty_fixture_dir();
+        write_cursor_desktop_session(tmp.path());
+        let mut cmd = cmd_with_home(tmp.path());
+        cmd.env("APPDATA", tmp.path().join("AppData/Roaming"));
+        cmd.args(["graph", "--no-spinner", "--client"]);
+        if external {
+            cmd.arg("cursor").arg("--home").arg(tmp.path());
+        } else {
+            cmd.arg("opencode");
+        }
+        cmd.assert().success();
+        assert!(!tmp
+            .path()
+            .join(".config/tokscale/cursor-credentials.json")
+            .exists());
+    }
+}
+
+#[test]
 fn test_graph_fresh_cursor_cache_skips_auto_sync_warning() {
     let tmp = create_empty_fixture_dir();
+    write_cursor_desktop_session(tmp.path());
     write_cursor_credentials(tmp.path());
     write_cursor_usage_cache(tmp.path());
 
+    let credentials = tmp.path().join(".config/tokscale/cursor-credentials.json");
+    let saved_credentials = fs::read(&credentials).unwrap();
     let output = cmd_with_home(tmp.path())
+        .env("APPDATA", tmp.path().join("AppData/Roaming"))
         .env("HTTPS_PROXY", "http://127.0.0.1:9")
         .env("HTTP_PROXY", "http://127.0.0.1:9")
         .env("ALL_PROXY", "http://127.0.0.1:9")
@@ -3400,6 +3563,11 @@ fn test_graph_fresh_cursor_cache_skips_auto_sync_warning() {
     assert!(
         !stderr.contains("Cursor sync failed") && !stderr.contains("Cursor sync warning"),
         "fresh Cursor cache should skip implicit graph sync; stderr: {stderr}"
+    );
+    assert_eq!(
+        fs::read(credentials).unwrap(),
+        saved_credentials,
+        "a fresh report must retain its saved login even when the desktop account differs"
     );
 }
 
