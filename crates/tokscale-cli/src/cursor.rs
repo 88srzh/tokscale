@@ -85,7 +85,7 @@ pub const CURSOR_AUTO_SYNC_FRESHNESS: Duration = Duration::from_secs(5 * 60);
 /// that asks for the platform's own TLS stack: Security.framework on macOS,
 /// schannel on Windows, OpenSSL on Linux. Every other client stays on rustls
 /// through `tokscale_core::http`.
-fn cursor_http_client_builder() -> reqwest::ClientBuilder {
+pub(crate) fn cursor_http_client_builder() -> reqwest::ClientBuilder {
     #[allow(clippy::disallowed_methods)]
     let builder = reqwest::Client::builder().timeout(CURSOR_HTTP_TIMEOUT);
 
@@ -698,6 +698,12 @@ fn find_cursor_state_vscdb(home_dir: &Path) -> Option<PathBuf> {
     cursor_state_vscdb_candidates(home_dir)
         .into_iter()
         .find(|path| path.is_file())
+}
+
+/// Public path lookup for subscription-usage and other callers that need the
+/// desktop `state.vscdb` without depending on a session cookie conversion.
+pub fn find_cursor_state_vscdb_for_usage(home_dir: &Path) -> Option<PathBuf> {
+    find_cursor_state_vscdb(home_dir)
 }
 
 /// Read `cursorAuth/accessToken` from a Cursor `state.vscdb` SQLite DB.
