@@ -341,6 +341,20 @@ impl SourceFingerprint {
         Self::from_path_with_related(path, std::iter::empty())
     }
 
+    /// Fingerprint a Codex source together with the exact decoded archive limit
+    /// that governs compressed rollouts. The virtual related-file marker reuses
+    /// the existing cache wire layout, so retained-history cache formats do not
+    /// need a lossy global migration for this Codex-only parser input.
+    pub(crate) fn from_codex_path(path: &Path) -> Option<Self> {
+        let mut fingerprint = Self::from_path(path)?;
+        if crate::sessions::utils::is_zst_path(path) {
+            fingerprint
+                .related_files
+                .push(codex_archive_limit_fingerprint(path));
+        }
+        Some(fingerprint)
+    }
+
     #[cfg(test)]
     pub(crate) fn from_sqlite_path(path: &Path) -> Option<Self> {
         let related_paths = ["-wal"]
@@ -470,6 +484,26 @@ impl SourceFingerprint {
 
     pub(crate) fn check_path(path: &Path, cached: Option<&Self>) -> Option<FingerprintStatus> {
         Self::check_path_with_related(path, std::iter::empty(), cached)
+    }
+
+    pub(crate) fn check_codex_path(
+        path: &Path,
+        cached: Option<&Self>,
+    ) -> Option<FingerprintStatus> {
+        if !crate::sessions::utils::is_zst_path(path) {
+            return Self::check_path(path, cached);
+        }
+
+        if let Some(cached) = cached {
+            let expected = codex_archive_limit_fingerprint(path);
+            if cached.related_files.as_slice() == [expected]
+                && primary_fingerprint_matches(path, cached)?
+            {
+                return Some(FingerprintStatus::Unchanged);
+            }
+        }
+
+        Self::from_codex_path(path).map(FingerprintStatus::Changed)
     }
 
     /// Check a non-Codex source without rebuilding its write-only whole-file
@@ -829,6 +863,23 @@ impl SourceFingerprint {
             content_hash,
             related_files,
         })
+    }
+}
+
+const CODEX_ARCHIVE_LIMIT_FINGERPRINT_SUFFIX: &str = "tokscale-config:codex-max-decoded-bytes";
+
+fn codex_archive_limit_fingerprint(path: &Path) -> RelatedFileFingerprint {
+    // This is a virtual parser input, not a file probe. `size` is an existing
+    // exact u64 wire field, and the fixed suffix distinguishes it from genuine
+    // sidecars. Keeping the source path avoids persisting any additional path.
+    RelatedFileFingerprint {
+        suffix: CODEX_ARCHIVE_LIMIT_FINGERPRINT_SUFFIX.to_string(),
+        path: CachedPath::from_path(path),
+        exists: false,
+        size: crate::sessions::codex::max_codex_archive_bytes(),
+        modified_ns: 0,
+        sample_hashes: Vec::new(),
+        content_hash: [0; 32],
     }
 }
 
@@ -4155,6 +4206,7 @@ mod tests {
             SOURCE_CACHE_ABORT_POINT_ENV,
             SOURCE_CACHE_ABORT_PATHS_ENV,
             SOURCE_CACHE_ABORT_MARKER_ENV,
+            "TOKSCALE_CODEX_MAX_DECODED_BYTES",
         ]);
         env.set("HOME", temp_home);
         env.set("XDG_CONFIG_HOME", temp_home.join(".config"));
@@ -4176,6 +4228,7 @@ mod tests {
         env.remove(SOURCE_CACHE_ABORT_POINT_ENV);
         env.remove(SOURCE_CACHE_ABORT_PATHS_ENV);
         env.remove(SOURCE_CACHE_ABORT_MARKER_ENV);
+        env.remove("TOKSCALE_CODEX_MAX_DECODED_BYTES");
         env
     }
 

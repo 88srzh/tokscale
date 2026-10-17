@@ -716,6 +716,20 @@ pub(crate) fn register_archive_limit_override(
     ArchiveLimitOverrideGuard { path }
 }
 
+pub(crate) fn parse_max_codex_archive_bytes(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0 && v < u64::MAX)
+        .unwrap_or(MAX_CODEX_ARCHIVE_BYTES)
+}
+
+pub fn max_codex_archive_bytes() -> u64 {
+    parse_max_codex_archive_bytes(
+        std::env::var("TOKSCALE_CODEX_MAX_DECODED_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
 fn archive_limit_for_path(_path: &Path) -> u64 {
     #[cfg(test)]
     if let Some(max_bytes) = ARCHIVE_LIMIT_OVERRIDES
@@ -727,7 +741,7 @@ fn archive_limit_for_path(_path: &Path) -> u64 {
         return max_bytes;
     }
 
-    MAX_CODEX_ARCHIVE_BYTES
+    max_codex_archive_bytes()
 }
 
 #[cfg(test)]
@@ -5307,6 +5321,36 @@ mod tests {
         assert!(parsed.consumed_offset > SIMULATED_LEGACY_LIMIT);
         assert_eq!(parsed.messages.len(), 1);
         assert_eq!(parsed.messages[0].tokens.total(), 160);
+    }
+
+    #[test]
+    fn parse_max_codex_archive_bytes_validates_bounds_and_falls_back() {
+        assert_eq!(parse_max_codex_archive_bytes(None), MAX_CODEX_ARCHIVE_BYTES);
+        assert_eq!(parse_max_codex_archive_bytes(Some("65536")), 65_536);
+        assert_eq!(
+            parse_max_codex_archive_bytes(Some(" 2147483648 ")),
+            2_147_483_648
+        );
+        assert_eq!(
+            parse_max_codex_archive_bytes(Some(&(u64::MAX - 1).to_string())),
+            u64::MAX - 1
+        );
+        assert_eq!(
+            parse_max_codex_archive_bytes(Some("0")),
+            MAX_CODEX_ARCHIVE_BYTES
+        );
+        assert_eq!(
+            parse_max_codex_archive_bytes(Some("-1")),
+            MAX_CODEX_ARCHIVE_BYTES
+        );
+        assert_eq!(
+            parse_max_codex_archive_bytes(Some("invalid")),
+            MAX_CODEX_ARCHIVE_BYTES
+        );
+        assert_eq!(
+            parse_max_codex_archive_bytes(Some(&u64::MAX.to_string())),
+            MAX_CODEX_ARCHIVE_BYTES
+        );
     }
 
     #[test]
