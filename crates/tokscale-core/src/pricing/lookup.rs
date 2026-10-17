@@ -315,6 +315,7 @@ pub struct LookupResult {
     pub pricing: ModelPricing,
     pub source: String,
     pub matched_key: String,
+    pub matched_provider_id: Option<String>,
     pub evidence: ResolutionEvidence,
 }
 
@@ -555,6 +556,7 @@ impl PricingLookup {
             .and_then(|c| c.get(&cache_key).cloned())
         {
             return cached.map(|c| LookupResult {
+                matched_provider_id: None,
                 pricing: c.pricing,
                 source: c.source,
                 matched_key: c.matched_key,
@@ -1525,6 +1527,7 @@ impl PricingLookup {
                 return Some(LookupResult {
                     pricing: pricing.clone(),
                     source: "Models.dev".into(),
+                    matched_provider_id: None,
                     matched_key: key.clone(),
                     evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
                 });
@@ -1540,6 +1543,7 @@ impl PricingLookup {
                     return Some(LookupResult {
                         pricing: pricing.clone(),
                         source: "Models.dev".into(),
+                        matched_provider_id: None,
                         matched_key: key.clone(),
                         evidence: ResolutionEvidence::deterministic(ResolutionKind::ModelPart),
                     });
@@ -1753,6 +1757,7 @@ impl PricingLookup {
                     return Some(LookupResult {
                         pricing: pricing.clone(),
                         source: "Models.dev".into(),
+                        matched_provider_id: None,
                         matched_key: models_dev_key.clone(),
                         evidence: ResolutionEvidence::deterministic(ResolutionKind::ProviderPrefix),
                     });
@@ -2570,7 +2575,7 @@ fn compute_xai_full_request_200k_cost(
     )
 }
 
-fn compute_cost_for_lookup(
+pub(super) fn compute_cost_for_lookup(
     result: &LookupResult,
     provider_id: Option<&str>,
     usage: &TokenBreakdown,
@@ -2578,7 +2583,7 @@ fn compute_cost_for_lookup(
     compute_cost_for_lookup_inner(result, provider_id, usage, false)
 }
 
-fn compute_cost_for_multi_call_aggregate(
+pub(super) fn compute_cost_for_multi_call_aggregate(
     result: &LookupResult,
     provider_id: Option<&str>,
     usage: &TokenBreakdown,
@@ -3230,6 +3235,7 @@ fn lookup_result_if_usable(
     has_any_usable_pricing(pricing).then(|| LookupResult {
         pricing: pricing.clone(),
         source: source.into(),
+        matched_provider_id: None,
         matched_key: matched_key.into(),
         evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
     })
@@ -3869,6 +3875,7 @@ fn select_best_match(
             dataset.get(k.as_str()).map(|pricing| LookupResult {
                 pricing: pricing.clone(),
                 source: source.into(),
+                matched_provider_id: None,
                 matched_key: (*k).clone(),
                 evidence: ResolutionEvidence {
                     kind,
@@ -7923,6 +7930,7 @@ mod tests {
 
     fn anthropic_haiku_55_100k_result(key: &str, source: &str) -> LookupResult {
         LookupResult {
+            matched_provider_id: None,
             matched_key: key.into(),
             source: source.into(),
             evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
@@ -7944,6 +7952,7 @@ mod tests {
 
     fn openai_272k_result(key: &str, source: &str) -> LookupResult {
         LookupResult {
+            matched_provider_id: None,
             matched_key: key.into(),
             source: source.into(),
             evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
@@ -7962,6 +7971,7 @@ mod tests {
 
     fn xai_200k_result(key: &str, source: &str) -> LookupResult {
         LookupResult {
+            matched_provider_id: None,
             matched_key: key.into(),
             source: source.into(),
             evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
@@ -8341,6 +8351,7 @@ mod tests {
     #[test]
     fn xai_128k_only_row_keeps_generic_progressive_pricing() {
         let result = LookupResult {
+            matched_provider_id: None,
             matched_key: "xai/grok-4-fast".into(),
             source: "LiteLLM".into(),
             evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
@@ -8605,6 +8616,7 @@ mod tests {
     #[test]
     fn gpt_6_astra_applies_full_request_pricing_above_272k_threshold() {
         let result = LookupResult {
+            matched_provider_id: None,
             matched_key: "gpt-6-astra".into(),
             source: "LiteLLM".into(),
             evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
@@ -8714,6 +8726,7 @@ mod tests {
         ) in cases
         {
             let result = LookupResult {
+                matched_provider_id: None,
                 matched_key: model.into(),
                 source: "LiteLLM".into(),
                 evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
@@ -8764,6 +8777,7 @@ mod tests {
     fn gpt_6_1_sol_uses_full_request_rates_above_272k_for_base_and_snapshot_ids() {
         for model in ["gpt-6.1-sol", "gpt-6.1-sol-2026-09-29"] {
             let result = LookupResult {
+                matched_provider_id: None,
                 matched_key: model.into(),
                 source: "LiteLLM".into(),
                 evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),

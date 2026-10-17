@@ -1031,6 +1031,14 @@ fn parse_pi_format_file_inner(
             },
             reported_cost.unwrap_or(0.0),
             agent.clone(),
+        )
+        .with_billing(
+            // Record-level evidence only: a reply or tool result names its
+            // provider on the message, a standalone operation at the root.
+            // Legacy model-less usage rows inherit the session selection for
+            // attribution but supply no billing evidence.
+            clean_recorded_provider,
+            super::BillingIdentityOrigin::ExplicitRecord,
         );
         if reported_cost.is_some() {
             unified.mark_provider_reported_cost();
