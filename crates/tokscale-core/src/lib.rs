@@ -760,6 +760,9 @@ pub struct ModelUsage {
     pub workspace_label: Option<String>,
     pub session_id: Option<String>,
     pub model: String,
+    /// Alias-free identities represented by this grouped row. Coverage only:
+    /// the row's tokens and cost cannot be apportioned among these IDs.
+    pub canonical_model_ids: Vec<String>,
     pub provider: String,
     pub input: i64,
     pub output: i64,
@@ -5217,6 +5220,7 @@ fn aggregate_model_usage_entries_with_labeler(
                 None
             },
             model: normalized.clone(),
+            canonical_model_ids: Vec::new(),
             provider: msg.provider_id.clone(),
             input: 0,
             output: 0,
@@ -5227,6 +5231,11 @@ fn aggregate_model_usage_entries_with_labeler(
             cost: 0.0,
             performance: ModelPerformance::default(),
         });
+
+        let model_id = canonical_model_id(&msg.model_id);
+        if !entry.canonical_model_ids.contains(&model_id) {
+            entry.canonical_model_ids.push(model_id);
+        }
 
         if merge_clients {
             if !entry.client.split(", ").any(|s| s == msg.client) {
@@ -5263,6 +5272,7 @@ fn aggregate_model_usage_entries_with_labeler(
     let mut entries: Vec<ModelUsage> = model_map
         .into_values()
         .map(|mut entry| {
+            entry.canonical_model_ids.sort_unstable();
             let total_tokens = entry
                 .input
                 .max(0)

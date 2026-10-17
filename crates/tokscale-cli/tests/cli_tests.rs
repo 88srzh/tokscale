@@ -5352,6 +5352,11 @@ fn test_models_alias_folds_variants_into_one_row() {
         .find(|e| e["model"] == "claude-sonnet-4")
         .unwrap();
     assert_eq!(
+        folded["canonicalModelIds"],
+        serde_json::json!(["claude-sonnet-4", "claude-sonnet-4-cc"]),
+        "aliases retain the identities behind the unchanged grouped amount"
+    );
+    assert_eq!(
         folded["input"].as_i64().unwrap(),
         2200,
         "folded row must include the variant's tokens, got {folded:?}"
@@ -5407,6 +5412,12 @@ fn test_models_alias_absent_is_noop() {
     // No settings.json / no modelAliases configured.
 
     let json = models_by_name(tmp.path());
+    for entry in json["entries"].as_array().unwrap() {
+        assert_eq!(
+            entry["canonicalModelIds"],
+            serde_json::json!([entry["model"]])
+        );
+    }
     let models: Vec<&str> = json["entries"]
         .as_array()
         .unwrap()
@@ -5423,6 +5434,74 @@ fn test_models_alias_absent_is_noop() {
         models.contains(&"claude-sonnet-4-cc"),
         "variant should remain separate without aliases, got {models:?}"
     );
+}
+
+#[test]
+fn test_models_opencode_names_preserve_canonical_coverage_without_splitting_amounts() {
+    let tmp = create_temp_fixture_dir();
+    let message = tmp
+        .path()
+        .join(".local/share/opencode/storage/message/session1/msg_b.json");
+    let mut data: serde_json::Value = serde_json::from_slice(&fs::read(&message).unwrap()).unwrap();
+    data["modelID"] = serde_json::json!("claude-sonnet-4-cc");
+    fs::write(message, serde_json::to_vec(&data).unwrap()).unwrap();
+    let before = models_by_name(tmp.path());
+    let config = tmp.path().join(".config/opencode");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("opencode.json"),
+        r#"{
+        "provider": { "anthropic": { "models": {
+            "claude-sonnet-4": { "name": "Shared Model" },
+            "claude-sonnet-4-cc": { "name": "Shared Model" }
+        } } }
+    }"#,
+    )
+    .unwrap();
+    for grouping in [
+        "model",
+        "client,session,model",
+        "client,workspace,session,model",
+    ] {
+        let output = cmd_with_home(tmp.path())
+            .args([
+                "--json",
+                "--client",
+                "opencode",
+                "--group-by",
+                grouping,
+                "--no-spinner",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let after: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let rows: Vec<_> = after["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["model"] == "Shared Model")
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["input"], 1800);
+        assert_eq!(
+            rows[0]["canonicalModelIds"],
+            serde_json::json!(["claude-sonnet-4", "claude-sonnet-4-cc"])
+        );
+        for field in [
+            "totalInput",
+            "totalOutput",
+            "totalCacheRead",
+            "totalCacheWrite",
+            "totalMessages",
+            "totalCost",
+        ] {
+            assert_eq!(
+                before[field], after[field],
+                "{field} changed under {grouping}"
+            );
+        }
+    }
 }
 
 #[test]
