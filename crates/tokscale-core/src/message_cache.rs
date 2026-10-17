@@ -1503,7 +1503,10 @@ fn parser_version(client: ClientId) -> u32 {
         // v17->v18: settle pending token_usage_record rows when turn_aborted or
         // task_complete ends their turn. Completed v17 rollouts keep the same
         // fingerprint, so their undercounted entries must be reparsed.
-        ClientId::Codex => 18,
+        // v18->v19: OpenCodex Responses combo attribution changes Codex's
+        // reported model/provider identity without changing token totals.
+        // The decoded archive limit remains an exact cache fingerprint marker.
+        ClientId::Codex => 19,
         // v4->v5: jcode's assistant-message timestamp is now back-calculated
         // to the turn start (timestamp - tool_duration_ms) instead of using
         // the recorded (end-anchored) timestamp directly. Follow-up to #890.
@@ -4966,11 +4969,13 @@ mod tests {
         // results, v13->v14 decodes compressed archives (.jsonl.zst),
         // v14->v15 stabilizes fallback-timestamp dedup across rollout copies,
         // v15->v16 counts usage records no token_count confirms, v16->v17
-        // skips oversized records while preserving later usage, and v17->v18
-        // settles pending usage when terminal events end a turn.
+        // skips oversized records while preserving later usage, v17->v18
+        // settles pending usage when terminal events end a turn, and
+        // v18->v19 re-attributes OpenCodex combo traffic to the observed
+        // physical model so cached rows cannot keep the virtual selector.
         // Each bump is what stops an existing cache from replaying the old
         // rows, so it has to be asserted rather than assumed.
-        assert_eq!(parser_version(ClientId::Codex), 18);
+        assert_eq!(parser_version(ClientId::Codex), 19);
         assert_eq!(parser_version(ClientId::Claude), 2);
     }
 
@@ -5873,7 +5878,7 @@ mod tests {
         cache.save_if_dirty();
         let warm = SourceMessageCache::load();
         let cached = warm.get(identity, &source).unwrap();
-        assert_eq!(cached.parser_version, 18);
+        assert_eq!(cached.parser_version, 19);
         assert_eq!(cached.messages, parsed);
     }
 
@@ -5981,11 +5986,131 @@ mod tests {
         let fresh_cache = SourceMessageCache::load();
         let fresh_entry = fresh_cache
             .get(identity, &source)
-            .expect("the production scan must persist a v18 replacement");
-        assert_eq!(fresh_entry.parser_version, 18);
+            .expect("the production scan must persist a v19 replacement");
+        assert_eq!(fresh_entry.parser_version, 19);
         assert!(
             codex_cache_entry_matches_fingerprint(&fresh_entry, &fingerprint),
-            "the v18 replacement must carry valid incremental metadata"
+            "the v19 replacement must carry valid incremental metadata"
+        );
+
+        // Scan again through the same production path and verify that the
+        // valid warm entry preserves the reparsed result.
+        let cached = crate::parse_local_unified_messages_with_pricing(options, None)
+            .await
+            .unwrap();
+        assert_eq!(cached, reparsed);
+        let warm_cache = SourceMessageCache::load();
+        let warm_entry = warm_cache.get(identity, &source).unwrap();
+        assert!(codex_cache_entry_matches_fingerprint(
+            &warm_entry,
+            &fingerprint
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn codex_v18_shards_are_reparsed_for_opencodex_attribution() {
+        // The OpenCodex combo overlay rewrites the reported model/provider of
+        // already-cached Codex rows. A v18 entry with a valid fingerprint
+        // would otherwise keep the virtual selector forever, so only the
+        // version bump can retire it. The stale entry deliberately holds
+        // wrong tokens, so a warm replay of the old row cannot pass.
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let sessions = temp_home.path().join(".codex/sessions/2026/10/01");
+        fs::create_dir_all(&sessions).unwrap();
+        let source =
+            sessions.join("rollout-2026-10-01T00-00-00-01a0f000-0000-7000-8000-000000000001.jsonl");
+        fs::write(
+            &source,
+            br#"{"timestamp":"2026-10-01T00:00:00Z","type":"session_meta","payload":{"id":"01a0f000-0000-7000-8000-000000000001","originator":"codex_vscode","source":"vscode","model_provider":"openai"}}
+{"timestamp":"2026-10-01T00:01:00Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}
+{"timestamp":"2026-10-01T00:01:05Z","type":"token_usage_record","payload":{"turn_id":"turn-1","response_id":"resp-1","usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110}}}
+{"timestamp":"2026-10-01T00:01:05.005Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110}}}}
+{"timestamp":"2026-10-01T00:02:00Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}
+{"timestamp":"2026-10-01T00:02:00.005Z","type":"token_usage_record","payload":{"turn_id":"turn-2","response_id":"resp-2","usage":{"input_tokens":500,"cached_input_tokens":200,"output_tokens":40,"total_tokens":540}}}
+{"timestamp":"2026-10-01T00:02:00.010Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-2"}}
+"#,
+        )
+        .unwrap();
+
+        let identity = CacheIdentity::for_client(ClientId::Codex);
+        let stale_identity = CacheIdentity {
+            parser_version: 18,
+            ..identity
+        };
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        // What v18 cached: an intentionally wrong single-token row. Its incremental
+        // metadata is valid for the unchanged file, so generation v18 would
+        // reuse this undercounted row instead of reparsing.
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            &source,
+            fingerprint.clone(),
+            vec![UnifiedMessage::new(
+                identity.namespace,
+                "gpt-5.5",
+                "openai",
+                "01a0f000-0000-7000-8000-000000000001",
+                1790812865000,
+                TokenBreakdown {
+                    input: 1,
+                    ..Default::default()
+                },
+                0.0,
+            )],
+            Vec::new(),
+            Some(CodexIncrementalCache {
+                state: CodexParseState::default(),
+                consumed_offset: fingerprint.size,
+                ends_with_newline: true,
+                prefix_hash: fingerprint.content_hash,
+            }),
+        );
+        assert!(codex_cache_entry_matches_fingerprint(
+            &stale_entry,
+            &fingerprint
+        ));
+        let shard = cache_shard_path(identity, &source);
+        ensure_cache_dir(shard.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &shard,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        assert_eq!(SourceFingerprint::from_path(&source).unwrap(), fingerprint);
+        let options = crate::LocalParseOptions {
+            home_dir: Some(temp_home.path().to_string_lossy().into_owned()),
+            use_env_roots: false,
+            clients: Some(vec!["codex".to_string()]),
+            ..crate::LocalParseOptions::default()
+        };
+
+        // Drive the complete production scanner/cache path. It must reject
+        // the unchanged v17 entry and fully parse the terminal turn.
+        let reparsed = crate::parse_local_unified_messages_with_pricing(options.clone(), None)
+            .await
+            .unwrap();
+        assert_eq!(reparsed.len(), 2);
+        assert_eq!(
+            reparsed
+                .iter()
+                .map(|message| message.tokens.total())
+                .sum::<i64>(),
+            110 + 540
+        );
+
+        let fresh_cache = SourceMessageCache::load();
+        let fresh_entry = fresh_cache
+            .get(identity, &source)
+            .expect("the production scan must persist a v19 replacement");
+        assert_eq!(fresh_entry.parser_version, 19);
+        assert!(
+            codex_cache_entry_matches_fingerprint(&fresh_entry, &fingerprint),
+            "the v19 replacement must carry valid incremental metadata"
         );
 
         // Scan again through the same production path and verify that the
