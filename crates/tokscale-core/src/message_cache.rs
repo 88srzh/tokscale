@@ -4703,7 +4703,6 @@ mod tests {
     use crate::TokenBreakdown;
     use std::io::Write;
     use tempfile::{NamedTempFile, TempDir};
-    use wait_timeout::ChildExt;
 
     #[test]
     fn released_codex_v10_parser15_migrates_incremental_ordinal_and_warm_roundtrips() {
@@ -11835,15 +11834,25 @@ mod tests {
                 )
                 .spawn()
                 .unwrap();
-            let status = match child
-                .wait_timeout(std::time::Duration::from_secs(60))
-                .unwrap()
-            {
-                Some(status) => status,
-                None => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("{point}: abort child exceeded 60-second bound");
+            // Poll the real condition (the child's exit status) instead of
+            // blocking on `wait_timeout`. That crate parks on a SIGCHLD
+            // self-pipe after one initial `try_wait`; under a ptrace-based
+            // coverage tracer (cargo-tarpaulin's default engine) the tracer
+            // interposes on the child's death, the SIGCHLD the parked wait
+            // relies on is consumed or arrives before the handler exists, and
+            // this test slept the full 60 seconds next to an already-dead
+            // child (CI /proc sampling showed the child as a zombie within
+            // seconds while this wait still blocked).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            let status = loop {
+                match child.try_wait().unwrap() {
+                    Some(status) => break status,
+                    None if std::time::Instant::now() >= deadline => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("{point}: abort child exceeded 60-second bound");
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(25)),
                 }
             };
             assert!(!status.success(), "{point}: child must abort");
