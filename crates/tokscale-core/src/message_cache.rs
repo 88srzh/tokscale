@@ -1285,14 +1285,21 @@ const SHARED_PARSER_FAMILIES: &[SharedParserFamily] = &[
             // +1: Pi subagent sessions now derive agent attribution from
             // session_info names; version-1 caches carry those messages
             // without agent metadata.
-            (ClientId::Pi, 2),
+            // +1 more: Pi now counts the billed operations that are not
+            // assistant replies (`compaction`, `branch_summary`, `usage`,
+            // `toolResult`), which version-6 caches omit entirely.
+            (ClientId::Pi, 3),
             // +1: Kimchi's Pi-compatible messages now carry stable
             // namespaced deduplication keys.
-            (ClientId::Kimchi, 1),
+            // +1 more: billed operations, as for Pi. The shared base did not
+            // move because Prime Agent rides on the same parser with
+            // `count_operations` off and its own caches are unaffected.
+            (ClientId::Kimchi, 2),
             // +1: Standard Pi/OMP/Senpi parser now emits cross-session
             // namespaced dedup keys (same behavior as Kimchi/Prime).
-            (ClientId::Omp, 1),
-            (ClientId::Senpi, 1),
+            // +1 more: billed operations, as for Pi.
+            (ClientId::Omp, 2),
+            (ClientId::Senpi, 2),
             // +3 for Prime Agent's independent history. v1->v2 strips a
             // leading BOM and recovers records containing undecodable
             // bytes; its accounting scan also continues past those records
@@ -5337,10 +5344,10 @@ mod tests {
         );
         let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
         for (client, previous_version) in [
-            (ClientId::Pi, 4),
-            (ClientId::Kimchi, 3),
-            (ClientId::Omp, 3),
-            (ClientId::Senpi, 3),
+            (ClientId::Pi, 5),
+            (ClientId::Kimchi, 4),
+            (ClientId::Omp, 4),
+            (ClientId::Senpi, 4),
             (ClientId::PrimeAgent, 6),
         ] {
             let current = CacheIdentity::for_client(client);
@@ -5378,10 +5385,10 @@ mod tests {
         );
         let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
         for (client, completion_anchored_version) in [
-            (ClientId::Pi, 5),
-            (ClientId::Kimchi, 4),
-            (ClientId::Omp, 4),
-            (ClientId::Senpi, 4),
+            (ClientId::Pi, 6),
+            (ClientId::Kimchi, 5),
+            (ClientId::Omp, 5),
+            (ClientId::Senpi, 5),
             (ClientId::PrimeAgent, 7),
         ] {
             let current = CacheIdentity::for_client(client);
@@ -7230,10 +7237,10 @@ mod tests {
             (
                 "pi-format",
                 &[
-                    (ClientId::Pi, 2),
-                    (ClientId::Kimchi, 1),
-                    (ClientId::Omp, 1),
-                    (ClientId::Senpi, 1),
+                    (ClientId::Pi, 3),
+                    (ClientId::Kimchi, 2),
+                    (ClientId::Omp, 2),
+                    (ClientId::Senpi, 2),
                     (ClientId::PrimeAgent, 4),
                 ],
             ),
