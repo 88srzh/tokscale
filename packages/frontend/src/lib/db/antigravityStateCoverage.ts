@@ -3,7 +3,6 @@ import {
   modelsForHighWater,
   PARSER_HIGH_WATER_STATE_VERSION,
   type DeviceParserStates,
-  type ParserAggregateHighWater,
 } from "./parserHighWater";
 import { ownValue } from "../safeRecord";
 
@@ -25,7 +24,7 @@ const COVERAGE_FIELDS = [
 
 type Coverage = Record<(typeof COVERAGE_FIELDS)[number], number>;
 type CoverageSummary = { total: Coverage; models: Map<string, Coverage> };
-type PriorDay = { sourceBreakdown: unknown };
+type PriorDay = { date?: string; sourceBreakdown: unknown };
 
 function emptyCoverage(): Coverage {
   return {
@@ -84,7 +83,7 @@ function sameCoverage(left: Coverage, right: Coverage): boolean {
 
 type LegacyLedger = {
   days: Record<string, ClientBreakdownData>;
-  aggregate: ParserAggregateHighWater;
+  aggregate: Coverage;
 };
 
 /** Per-field lifetime of one ledger: its aggregate or its day cells, whichever is larger. */
@@ -99,10 +98,37 @@ function ledgerLifetime(ledger: LegacyLedger): Coverage {
   return lifetime;
 }
 
+/**
+ * Normalize legacy Antigravity model IDs to their canonical family key when
+ * comparing pre-transition per-surface parser ledgers. This lets surfaces that
+ * recorded the same response before and after model canonicalization
+ * (`gemini-default` / `gemini-3.5-flash-*`, `claude-*-thinking` -> `claude-*`)
+ * fold as one lifetime while keeping distinct models (e.g. `gemini-3-pro` vs.
+ * `claude-sonnet-4-6`) separate even when their seven-field totals match.
+ */
+function canonicalLedgerModelId(modelId: string): string {
+  const trimmed = modelId.trim().toLowerCase();
+  if (
+    trimmed === "gemini-default" ||
+    trimmed === "gemini-3-flash-a" ||
+    trimmed === "gemini-3-flash-preview" ||
+    trimmed === "gemini-3.5-flash" ||
+    trimmed.startsWith("gemini-3.5-flash-")
+  ) {
+    return "gemini-3.5-flash";
+  }
+  if (trimmed.startsWith("claude-") && trimmed.endsWith("-thinking")) {
+    return trimmed.slice(0, -"-thinking".length);
+  }
+  return trimmed;
+}
+
 function ledgerModels(ledger: LegacyLedger): Set<string> {
   const models = new Set<string>();
   for (const cell of Object.values(ledger.days)) {
-    for (const modelId of Object.keys(modelsForHighWater(cell))) models.add(modelId);
+    for (const modelId of Object.keys(modelsForHighWater(cell))) {
+      models.add(canonicalLedgerModelId(modelId));
+    }
   }
   return models;
 }
@@ -110,10 +136,11 @@ function ledgerModels(ledger: LegacyLedger): Set<string> {
 /**
  * Ledgers that record one credited lifetime from different surfaces. Parsers
  * can date the same conversation differently (session start vs. per
- * generation), so their day cells need not match. Identical lifetime totals on
- * every field, the same models and at least one shared date are treated as
- * the same lifetime. Distinct usage with coincidentally equal totals is kept
- * apart by requiring a shared date.
+ * generation) and canonicalize model IDs across releases, so their day cells
+ * need not match. Identical lifetime totals on every field, the same canonical
+ * models and at least one shared date are treated as the same lifetime.
+ * Distinct usage with coincidentally equal totals is kept apart by requiring
+ * matching canonical models and a shared date.
  */
 function oneLifetime(ledgers: LegacyLedger[]): boolean {
   if (ledgers.length < 2) return false;
@@ -141,10 +168,11 @@ function oneLifetime(ledgers: LegacyLedger[]): boolean {
  * stays conservative (summed, so an uncovered snapshot freezes, never drops):
  *
  * - Whole ledgers recording one lifetime (see `oneLifetime`) fold by max.
- * - Otherwise an identical (date, model) cell in more than one ledger is
- *   treated as one response credited twice and counts once. Every other cell
- *   is distinct usage and is summed. A ledger's aggregate excess beyond its
- *   own day cells cannot be attributed to a cell, so it is also summed.
+ * - Otherwise an identical (date, canonical model) cell in more than one
+ *   ledger is treated as one response credited twice and counts once. Every
+ *   other cell is distinct usage and is summed. A ledger's aggregate excess
+ *   beyond its own day cells cannot be attributed to a cell, so it is also
+ *   summed.
  *
  * Both are strong heuristics, not proofs: distinct usage whose totals match
  * on all seven fields would be undercounted.
@@ -168,19 +196,30 @@ function legacyLedgerCoverage(
   let unverifiable = false;
 
   for (const ledger of ledgers) {
+    const seenInEarlierLedgers = new Map(
+      [...cellsByDateModel.entries()].map(([key, vectors]) => [key, [...vectors]]),
+    );
     for (const [date, cell] of Object.entries(ledger.days)) {
       for (const [modelId, model] of Object.entries(modelsForHighWater(cell))) {
         const vector = emptyCoverage();
         addCoverage(vector, model);
-        const key = `${date}\u0000${modelId}`;
+        const canonicalModelId = canonicalLedgerModelId(modelId);
+        const key = `${date}\u0000${canonicalModelId}`;
+        const earlier = seenInEarlierLedgers.get(key) ?? [];
+        const matchIndex = earlier.findIndex((existing) =>
+          sameCoverage(existing, vector),
+        );
+        if (matchIndex !== -1) {
+          earlier.splice(matchIndex, 1);
+          continue;
+        }
         const seen = cellsByDateModel.get(key) ?? [];
-        if (seen.some((existing) => sameCoverage(existing, vector))) continue;
         seen.push(vector);
         cellsByDateModel.set(key, seen);
         addCoverage(summary.total, vector);
-        const modelCoverage = summary.models.get(modelId) ?? emptyCoverage();
+        const modelCoverage = summary.models.get(canonicalModelId) ?? emptyCoverage();
         addCoverage(modelCoverage, vector);
-        summary.models.set(modelId, modelCoverage);
+        summary.models.set(canonicalModelId, modelCoverage);
       }
     }
 
@@ -224,6 +263,35 @@ export function antigravityPriorCoverage(
     }
     if (!state.days || !state.aggregate) {
       unverifiable = true;
+      continue;
+    }
+    if (
+      !COVERAGE_FIELDS.every(
+        (field) =>
+          Number.isSafeInteger(state.aggregate[field]) &&
+          state.aggregate[field] >= 0,
+      )
+    ) {
+      unverifiable = true;
+      continue;
+    }
+    if (state.stateVersion == null) {
+      // Schema v1 stored every observed cell maximum (`advanceDays`) and
+      // advanced its aggregate even when no cell could accept that growth.
+      // Rebuild its ledger from the rows that were actually credited in
+      // `existingDays`, matching `planParserHighWaterSubmission`.
+      const creditedCells = existingBreakdowns
+        .map((breakdown) => ownValue(breakdown, client))
+        .filter((cell): cell is ClientBreakdownData => cell !== undefined);
+      const creditedDays: Record<string, ClientBreakdownData> = {};
+      existingDays.forEach((day, index) => {
+        const cell = ownValue(existingBreakdowns[index], client);
+        if (cell) creditedDays[day.date ?? String(index)] = cell;
+      });
+      ledgers.push({
+        days: creditedDays,
+        aggregate: coverage(creditedCells).total,
+      });
       continue;
     }
     ledgers.push({ days: state.days, aggregate: state.aggregate });
