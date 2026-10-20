@@ -286,7 +286,7 @@ pub async fn generate_graph(options: ReportOptions) -> Result<GraphResult, Strin
 }
 
 pub async fn generate_submission_graph(options: ReportOptions) -> Result<GraphResult, String> {
-    crate::generate_submission_graph_v2(options)
+    crate::generate_submission_graph_v2(options, &std::collections::BTreeSet::new())
         .await
         .map(Into::into)
 }

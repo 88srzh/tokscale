@@ -5505,9 +5505,52 @@ fn to_ts_token_contribution_data(
     }
 }
 
+/// Atomic source families: the receiver advances them only when every member
+/// arrives in the same snapshot (see MICODE_FAMILY/ANTIGRAVITY_FAMILY in
+/// packages/frontend/src/lib/db/parserHighWater.ts).
+const MICODE_FAMILY: &[&str] = &["micode", "micode-desktop"];
+const ANTIGRAVITY_FAMILY: &[&str] = &["antigravity", "antigravity-cli", "antigravity-extension"];
+
+/// Clients a date-filtered submit still ships complete. The receiver freezes
+/// every versioned parser and atomic source family without full-history
+/// authority, so letting `since`/`until`/`year` scope them would discard
+/// their usage outright instead of narrowing it. Amp additionally needs a
+/// complete thread export before any snapshot of it can claim full coverage.
+/// An atomic-family member is exempted only when the whole family was
+/// selected — otherwise the family plan freezes anyway and the exemption
+/// would bypass the requested date bound without advancing anything.
+fn full_history_exempt_clients<'a>(
+    clients: &'a [String],
+    amp_full_history_safe: bool,
+) -> impl Iterator<Item = String> + 'a {
+    let family_complete = |client: &str| {
+        let family: &[&str] = if MICODE_FAMILY.contains(&client) {
+            MICODE_FAMILY
+        } else if ANTIGRAVITY_FAMILY.contains(&client) {
+            ANTIGRAVITY_FAMILY
+        } else {
+            return true;
+        };
+        family
+            .iter()
+            .all(|member| clients.iter().any(|c| c.as_str() == *member))
+    };
+    clients
+        .iter()
+        .filter(move |client| {
+            tokscale_core::FULL_HISTORY_SUBMIT_CLIENTS.contains(&client.as_str())
+                && (client.as_str() != "amp" || amp_full_history_safe)
+                && family_complete(client.as_str())
+        })
+        .cloned()
+}
+
 /// Parser identity is declared for every scanned client, even for a partial
 /// date range. `full_history` is a separate capability bit: only an unbounded
-/// scan can establish or advance a cumulative rollout high-water.
+/// scan can establish or advance a cumulative rollout high-water. A partial
+/// scan still names the clients whose messages it ships unfiltered — their
+/// snapshot semantics make a partial window unsubmittable, so the graph
+/// exempts them from the date filter (see `FULL_HISTORY_SUBMIT_CLIENTS`).
 fn submit_scan_scope(
     clients: Option<&[String]>,
     full_history: bool,
@@ -5527,14 +5570,14 @@ fn submit_scan_scope(
             (client.clone(), version)
         })
         .collect();
-    let full_history_clients = if full_history {
+    let full_history_clients: Vec<String> = if full_history {
         clients
             .iter()
             .filter(|client| client.as_str() != "amp" || amp_full_history_safe)
             .cloned()
             .collect()
     } else {
-        Vec::new()
+        full_history_exempt_clients(clients, amp_full_history_safe).collect()
     };
     let every_client_complete = full_history_clients.len() == clients.len();
     Some(TsScanScope {
@@ -7114,13 +7157,20 @@ fn run_submit_command(
             .as_ref()
             .and_then(|result| result.warning.as_deref()),
     );
-    let scan_scope = submit_scan_scope(
-        clients.as_deref(),
-        full_history_scan,
-        amp_sync
-            .as_ref()
-            .is_none_or(amp::AutoSyncAmpResult::allows_full_history),
-    );
+    let amp_full_history_safe = amp_sync
+        .as_ref()
+        .is_none_or(amp::AutoSyncAmpResult::allows_full_history);
+    let scan_scope =
+        submit_scan_scope(clients.as_deref(), full_history_scan, amp_full_history_safe);
+    // The receivers freeze these clients without complete coverage, so a
+    // date-bounded submit ships their whole snapshot rather than dropping it.
+    // The same list the scan scope serializes as `fullHistoryClients` is
+    // handed to the graph, so what the payload declares and what it ships
+    // cannot diverge.
+    let full_history_clients: std::collections::BTreeSet<String> = scan_scope
+        .as_ref()
+        .map(|scope| scope.full_history_clients.iter().cloned().collect())
+        .unwrap_or_default();
     if explicit_cursor_filter || explicit_warp_filter || explicit_hindsight_filter {
         let cursor_setup_warnings = setup_warnings_for_report(&report_home, &clients);
         emit_cursor_setup_warnings(&cursor_setup_warnings);
@@ -7176,17 +7226,20 @@ fn run_submit_command(
     let rt = Runtime::new()?;
     let mut graph_result = rt
         .block_on(async {
-            generate_submission_graph_v2(ReportOptions {
-                home_dir: None,
-                use_env_roots: true,
-                clients,
-                since,
-                until,
-                year,
-                group_by: GroupBy::default(),
-                worktree_rollup: tokscale_core::WorktreeRollup::default(),
-                scanner_settings: tui::settings::load_scanner_settings(),
-            })
+            generate_submission_graph_v2(
+                ReportOptions {
+                    home_dir: None,
+                    use_env_roots: true,
+                    clients,
+                    since,
+                    until,
+                    year,
+                    group_by: GroupBy::default(),
+                    worktree_rollup: tokscale_core::WorktreeRollup::default(),
+                    scanner_settings: tui::settings::load_scanner_settings(),
+                },
+                &full_history_clients,
+            )
             .await
         })
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -10317,6 +10370,113 @@ mod tests {
         assert_eq!(scope.parser_versions.get("droid"), Some(&1));
     }
 
+    /// A date-bounded submit still ships the snapshot-integrity clients
+    /// complete: `SUPPORTED_VERSIONED_PARSERS` and the atomic source families
+    /// freeze on a partial snapshot, so scoping them by date would discard
+    /// the window's usage instead of narrowing it. Bounded-growth clients
+    /// stay filtered.
+    #[test]
+    fn submit_scan_scope_names_snapshot_clients_complete_on_a_partial_scan() {
+        let clients = vec![
+            "codex".to_string(),
+            "copilot".to_string(),
+            "droid".to_string(),
+        ];
+        let scope = submit_scan_scope(Some(&clients), false, true).expect("partial scope");
+
+        assert!(!scope.full_history);
+        assert_eq!(
+            scope.full_history_clients,
+            vec!["copilot".to_string(), "droid".to_string()]
+        );
+        assert!(!scope.full_history_clients.contains(&"codex".to_string()));
+    }
+
+    /// Amp only carries full-history authority when its thread export was
+    /// complete; the same gate applies on a partial scan as on a full one.
+    #[test]
+    fn submit_scan_scope_partial_scan_still_gates_amp_on_cache_completeness() {
+        let clients = vec!["amp".to_string(), "droid".to_string()];
+        let incomplete = submit_scan_scope(Some(&clients), false, false).expect("scope");
+        let complete = submit_scan_scope(Some(&clients), false, true).expect("scope");
+
+        assert!(!incomplete.full_history_clients.contains(&"amp".to_string()));
+        assert!(incomplete
+            .full_history_clients
+            .contains(&"droid".to_string()));
+        assert!(complete.full_history_clients.contains(&"amp".to_string()));
+    }
+
+    /// Selecting one member of an atomic family on a bounded scan cannot
+    /// satisfy the receiver's all-members completeness contract, so it must
+    /// not be exempted — its messages stay inside the requested date window.
+    /// With every member selected, the family ships complete as a unit.
+    #[test]
+    fn submit_scan_scope_partial_scan_skips_incomplete_atomic_families() {
+        let solo = submit_scan_scope(Some(&["micode".to_string()]), false, true).expect("scope");
+        assert!(solo.full_history_clients.is_empty());
+
+        let solo_ag = submit_scan_scope(
+            Some(&["antigravity-cli".to_string(), "codex".to_string()]),
+            false,
+            true,
+        )
+        .expect("scope");
+        assert!(solo_ag.full_history_clients.is_empty());
+
+        let family = vec!["micode".to_string(), "micode-desktop".to_string()];
+        let together = submit_scan_scope(Some(&family), false, true).expect("scope");
+        assert_eq!(together.full_history_clients, family);
+    }
+
+    /// The exemption list mirrors the receiver's snapshot-integrity set, which
+    /// registers devin-cli at generation 2: a bounded submit that filtered it
+    /// would freeze on the receiver and discard the window's usage, and its
+    /// recount proof only rides on a declared-complete snapshot.
+    #[test]
+    fn submit_scan_scope_names_devin_cli_complete_on_a_partial_scan() {
+        let clients = vec!["codex".to_string(), "devin-cli".to_string()];
+        let scope = submit_scan_scope(Some(&clients), false, true).expect("scope");
+
+        assert!(!scope.full_history);
+        assert_eq!(scope.full_history_clients, vec!["devin-cli".to_string()]);
+        assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
+    }
+
+    /// The blocker class from #1414 applies to the bounded path too: a client
+    /// the scan could only partially read must never be declared complete,
+    /// even though the date-filter exemption already shipped what it could
+    /// read. Withholding the declaration keeps the receiver's stored rows —
+    /// an undeclared versioned parser freezes instead of replacing history.
+    #[test]
+    fn bounded_scan_withholds_declaration_from_partially_read_exempt_clients() {
+        let clients = vec![
+            "codex".to_string(),
+            "devin-cli".to_string(),
+            "droid".to_string(),
+        ];
+        let mut scope = submit_scan_scope(Some(&clients), false, true).expect("scope");
+        assert_eq!(
+            scope.full_history_clients,
+            vec!["devin-cli".to_string(), "droid".to_string()]
+        );
+
+        let mut reads = std::collections::BTreeMap::new();
+        reads.insert(
+            "devin-cli".to_string(),
+            tokscale_core::SourceReadSummary {
+                discovered: 2,
+                unreadable: 1,
+            },
+        );
+        withhold_full_history_for_clients(&mut scope, &incompletely_read_clients(&reads));
+
+        assert!(!scope.full_history);
+        assert_eq!(scope.full_history_clients, vec!["droid".to_string()]);
+        // Identity stays declared; only the completeness authority is gone.
+        assert_eq!(scope.parser_versions.get("devin-cli"), Some(&2));
+    }
+
     /// Devin CLI generation 2 deduplicates `message_nodes` rows by request_id,
     /// which lowers the counted total — a recount, not a re-attribution. The
     /// server accepts the generation via `SUPPORTED_VERSIONED_PARSERS` and
@@ -10428,16 +10588,23 @@ mod tests {
             0
         );
 
+        // A date-bounded submit still ships devin-cli complete (it is in
+        // `FULL_HISTORY_SUBMIT_CLIENTS`), so the client keeps per-client
+        // full-history authority and its proof rides along: the payload
+        // dates every day the proof describes.
         let bounded = to_ts_token_contribution_data(
             &graph,
             None,
             submit_scan_scope(Some(&clients), false, true),
         );
-        assert!(bounded
-            .scan_scope
+        let bounded_scope = bounded.scan_scope.as_ref().expect("bounded scope");
+        assert!(!bounded_scope.full_history);
+        assert_eq!(bounded_scope.full_history_clients, clients);
+        let bounded_proofs = bounded_scope
+            .recount_proofs
             .as_ref()
-            .and_then(|scope| scope.recount_proofs.as_ref())
-            .is_none());
+            .expect("bounded submit ships the proof for a declared client");
+        assert!(bounded_proofs.contains_key("devin-cli"));
 
         // Full-history authority withheld for this client withholds its proof.
         let mut withheld = submit_scan_scope(Some(&clients), true, true).unwrap();
@@ -11040,9 +11207,50 @@ mod tests {
         );
         assert!(!partial_floors.contains_key("amp"));
 
-        let bounded_scope = submit_scan_scope(Some(&clients), false, true);
+        // A bounded submit still ships snapshot-integrity clients complete and
+        // names them in `full_history_clients`, so their floors are populated.
+        // A lone atomic-family member is not exempted — the receiver's family
+        // contract needs every member — so antigravity-cli carries no floor
+        // until the whole trio is selected.
+        let solo_bounded = submit_scan_scope(Some(&clients), false, true);
+        let solo_payload = to_ts_token_contribution_data(&graph, None, solo_bounded);
+        let solo_floors = solo_payload
+            .scan_scope
+            .as_ref()
+            .and_then(|s| s.retention_floors.as_ref())
+            .expect("floor populated for amp on a bounded submit");
+        assert!(!solo_floors.contains_key("antigravity-cli"));
+        assert_eq!(
+            solo_floors.get("amp").map(String::as_str),
+            Some("2026-08-07")
+        );
+
+        let family_clients = vec![
+            "antigravity".to_string(),
+            "antigravity-cli".to_string(),
+            "antigravity-extension".to_string(),
+            "amp".to_string(),
+        ];
+        let bounded_scope = submit_scan_scope(Some(&family_clients), false, true);
         let bounded_payload = to_ts_token_contribution_data(&graph, None, bounded_scope);
-        assert!(bounded_payload
+        let bounded_floors = bounded_payload
+            .scan_scope
+            .as_ref()
+            .and_then(|s| s.retention_floors.as_ref())
+            .expect("floors populated for exempt clients on a bounded submit");
+        assert_eq!(
+            bounded_floors.get("antigravity-cli").map(String::as_str),
+            Some("2026-08-05")
+        );
+        assert_eq!(
+            bounded_floors.get("amp").map(String::as_str),
+            Some("2026-08-07")
+        );
+
+        // A bounded submit of only bounded-growth clients carries no floors.
+        let growth_only = submit_scan_scope(Some(&["codex".to_string()]), false, true);
+        let growth_payload = to_ts_token_contribution_data(&graph, None, growth_only);
+        assert!(growth_payload
             .scan_scope
             .as_ref()
             .and_then(|s| s.retention_floors.as_ref())
