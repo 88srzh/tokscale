@@ -1617,6 +1617,20 @@ fn emit_codex_scan_warnings(
     tui_signal::update_codex_scan_warnings(warnings);
 }
 
+// Claude's generated mirror directory, not arbitrary ssh-prefixed projects.
+fn is_claude_ssh_mirror_directory(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 40
+        && bytes[..4].eq_ignore_ascii_case(b"ssh-")
+        && bytes[4..].iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
 #[allow(clippy::too_many_arguments)] // price_window rides beside pricing through the shared loader chain
 fn parse_all_messages_streaming<S: MessageSink>(
     home_dir: &str,
@@ -3057,12 +3071,30 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // lane asks for one of its sources, and entries whose file is gone are
     // pruned as that namespace loads. A scan therefore pays for the clients it
     // actually reads instead of for every client the machine has ever cached.
+    // Optional cache-only roots are lexical absolute paths, never canonicalized
+    // or stat'ed. Explicit --home scans ignore the host's environment contract.
+    let cached_claude_roots: Vec<PathBuf> = if use_env_roots {
+        std::env::var("TOKSCALE_CACHED_CLAUDE_DIRS")
+            .ok()
+            .and_then(|value| serde_json::from_str::<Vec<PathBuf>>(&value).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|root| root.is_absolute())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut source_cache = match cache_policy {
         SourceCachePolicy::Persistent | SourceCachePolicy::PersistentDeferred => {
             message_cache::SourceMessageCache::load()
         }
         SourceCachePolicy::InMemory => message_cache::SourceMessageCache::default(),
     };
+    source_cache.freeze_claude_roots(&cached_claude_roots);
+    // A shared namespace can contain other homes. Merely loading it must not
+    // probe or prune those sources, especially offline UNC roots during an
+    // isolated --home scan or after WSL collection has been disabled.
+    source_cache.restrict_claude_source_probes(scan_result.get(ClientId::Claude));
     let mut all_messages: Vec<UnifiedMessage> = Vec::new();
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
@@ -3183,10 +3215,60 @@ fn parse_all_messages_streaming<S: MessageSink>(
         flush_message(message, &flush_context, sink);
     }
 
+    // The caller owns source selection; this does not alter event deduplication
+    // or cached observations. Explicit --home reports are always isolated.
+    let excluded_claude_dirs: Vec<PathBuf> = if use_env_roots {
+        std::env::var("TOKSCALE_EXCLUDED_CLAUDE_DIRS")
+            .ok()
+            .and_then(|value| serde_json::from_str::<Vec<PathBuf>>(&value).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|path| path.is_absolute())
+            .flat_map(|path| {
+                let canonical = std::fs::canonicalize(&path).ok();
+                std::iter::once(path).chain(canonical)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // A bounded root policy avoids an environment variable that grows by one
+    // path per SSH session. Match cached sources too, even after deletion.
+    let remote_mirror_roots: Vec<PathBuf> = if use_env_roots {
+        std::env::var_os("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT")
+            .map(PathBuf::from)
+            .filter(|root| root.is_absolute())
+            .into_iter()
+            .flat_map(|root| {
+                let canonical = std::fs::canonicalize(&root).ok();
+                std::iter::once(root).chain(canonical)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let include_claude_path = |path: &Path| {
+        !excluded_claude_dirs
+            .iter()
+            .any(|root| path.starts_with(root))
+            && !remote_mirror_roots.iter().any(|root| {
+                path.strip_prefix(root)
+                    .ok()
+                    .and_then(|relative| relative.components().next())
+                    .and_then(|part| part.as_os_str().to_str())
+                    .is_some_and(is_claude_ssh_mirror_directory)
+            })
+    };
     let claude_home = PathBuf::from(home_dir);
+    let frozen_claude_sources = if include_all || clients.iter().any(|client| client == "claude") {
+        source_cache.cached_claude_sources(&cached_claude_roots, scan_result.get(ClientId::Claude))
+    } else {
+        Vec::new()
+    };
     let mut claude_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Claude)
         .par_iter()
+        .filter(|path| include_claude_path(path))
         .map(|path| {
             // Claude Code rewrites a transcript in place on resume/compact,
             // so a file can lose assistant turns it already published. The
@@ -3244,12 +3326,25 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 .into_iter()
                 .map(|(_, path)| path),
         );
+        if use_env_roots {
+            history_roots.extend(
+                scanner::parse_extra_dirs(
+                    &std::env::var("TOKSCALE_EXTRA_DIRS").unwrap_or_default(),
+                    &enabled,
+                )
+                .into_iter()
+                .map(|(_, root)| PathBuf::from(root)),
+            );
+        }
         history_roots.extend(
             scanner::built_in_extra_scan_paths_for(home_dir, &enabled, use_env_roots)
                 .into_iter()
                 .map(|(_, path)| path),
         );
         history_roots.extend(headless_roots.iter().cloned());
+        // Frozen sources are loaded separately, including still-existing files.
+        // Do not stat them again through the missing-history lookup.
+        history_roots.retain(|root| !cached_claude_roots.contains(root));
         history_roots.extend(
             history_roots
                 .clone()
@@ -3257,9 +3352,28 @@ fn parse_all_messages_streaming<S: MessageSink>(
                 .filter_map(|root| std::fs::canonicalize(root).ok()),
         );
         claude_outcomes.extend(
+            frozen_claude_sources
+                .into_iter()
+                .filter(|entry| include_claude_path(&entry.path.to_path_buf()))
+                .map(|entry| {
+                    let retained_message_keys = entry
+                        .messages
+                        .iter()
+                        .filter_map(|message| message.dedup_key.clone())
+                        .collect();
+                    CachedParseOutcome {
+                        messages: cached_messages(entry, pricing),
+                        retained_message_keys,
+                        cache_entry: None,
+                        invalidate_cache: false,
+                    }
+                }),
+        );
+        claude_outcomes.extend(
             source_cache
                 .missing_claude_history(&history_roots)
                 .into_iter()
+                .filter(|entry| include_claude_path(&entry.path.to_path_buf()))
                 .map(|entry| {
                     let retained_message_keys = entry
                         .messages
@@ -9961,6 +10075,255 @@ mod tests {
         contents.push_str(tail_suffix);
         assert_eq!(contents.len(), FILE_BYTES);
         contents
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_external_sources_share_dedup_with_frozen_cache_observations() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let remote = tempfile::TempDir::new().unwrap();
+        let _cache = redirect_cache_home(cache_home.path());
+        let mut env = crate::paths::test_env::EnvGuard::capture(&[
+            "CLAUDE_CONFIG_DIR",
+            "TOKSCALE_EXTRA_DIRS",
+            "TOKSCALE_CACHED_CLAUDE_DIRS",
+        ]);
+        env.set("CLAUDE_CONFIG_DIR", home.path().join(".claude"));
+        env.remove("TOKSCALE_CACHED_CLAUDE_DIRS");
+        let host_root = home.path().join(".claude/projects/ssh-session");
+        let remote_root = remote.path().join("projects/project");
+        std::fs::create_dir_all(&host_root).unwrap();
+        std::fs::create_dir_all(&remote_root).unwrap();
+        let row = |id: &str, input: i64| {
+            format!(
+                "{{\"type\":\"assistant\",\"timestamp\":\"2026-10-01T10:00:00Z\",\"sessionId\":\"session\",\"requestId\":\"req_{id}\",\"message\":{{\"id\":\"msg_{id}\",\"model\":\"claude-sonnet-4-6\",\"usage\":{{\"input_tokens\":{input},\"output_tokens\":0}}}}}}\n"
+            )
+        };
+        let host = host_root.join("session.jsonl");
+        let original = remote_root.join("session.jsonl");
+        std::fs::write(&host, format!("{}{}", row("shared", 100), row("host", 20))).unwrap();
+        std::fs::write(
+            &original,
+            format!("{}{}", row("shared", 100), row("remote", 30)),
+        )
+        .unwrap();
+        let extra = format!("claude:{}", remote_root.display());
+        env.set("TOKSCALE_EXTRA_DIRS", &extra);
+        let scan = |use_env_roots| {
+            parse_all_messages_with_pricing_with_env_strategy(
+                home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                None,
+                use_env_roots,
+                &scanner::ScannerSettings::default(),
+            )
+            .iter()
+            .map(|message| message.tokens.input)
+            .sum::<i64>()
+        };
+        assert_eq!(scan(true), 150);
+        env.set(
+            "TOKSCALE_CACHED_CLAUDE_DIRS",
+            serde_json::to_string(&vec![&remote_root]).unwrap(),
+        );
+        env.remove("TOKSCALE_EXTRA_DIRS");
+        std::fs::write(
+            &original,
+            format!("{}{}", row("shared", 100), row("remote", 70)),
+        )
+        .unwrap();
+        assert_eq!(
+            scan(true),
+            150,
+            "watch scans must not re-read the external source"
+        );
+        std::fs::write(
+            &host,
+            format!("{}{}{}", row("shared", 100), row("host", 20), row("new", 5)),
+        )
+        .unwrap();
+        assert_eq!(
+            scan(true),
+            155,
+            "new host turns join the frozen original once"
+        );
+        env.set("TOKSCALE_EXTRA_DIRS", &extra);
+        assert_eq!(
+            scan(true),
+            195,
+            "a full refresh observes the changed original"
+        );
+        env.remove("TOKSCALE_EXTRA_DIRS");
+        std::fs::remove_file(&original).unwrap();
+        assert_eq!(
+            scan(true),
+            195,
+            "an offline original keeps its accepted observation"
+        );
+        assert_eq!(scan(false), 125, "explicit --home stays isolated");
+        assert_eq!(
+            scan(true),
+            195,
+            "an isolated scan cannot prune an offline peer's cached source"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_source_exclusions_cover_live_and_retained_history_without_deleting_it() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let _cache = redirect_cache_home(cache_home.path());
+        let mut env = crate::paths::test_env::EnvGuard::capture(&[
+            "CLAUDE_CONFIG_DIR",
+            "TOKSCALE_EXCLUDED_CLAUDE_DIRS",
+            "TOKSCALE_EXTRA_DIRS",
+        ]);
+        env.set("CLAUDE_CONFIG_DIR", home.path().join(".claude"));
+        env.remove("TOKSCALE_EXCLUDED_CLAUDE_DIRS");
+        env.remove("TOKSCALE_EXTRA_DIRS");
+        let mirror = home.path().join(".claude/projects/ssh-session");
+        let local = home.path().join(".claude/projects/local");
+        for dir in [&mirror, &local] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let row = |id: &str, input: i64| {
+            format!("{{\"type\":\"assistant\",\"timestamp\":\"2026-10-01T10:00:00Z\",\"sessionId\":\"{id}\",\"requestId\":\"req_{id}\",\"message\":{{\"id\":\"msg_{id}\",\"model\":\"claude-sonnet-4-6\",\"usage\":{{\"input_tokens\":{input},\"output_tokens\":0}}}}}}\n")
+        };
+        let mirror_file = mirror.join("session.jsonl");
+        std::fs::write(&mirror_file, row("session", 100)).unwrap();
+        std::fs::write(local.join("local.jsonl"), row("local", 20)).unwrap();
+        let scan = |use_env_roots| {
+            parse_all_messages_with_pricing_with_env_strategy(
+                home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                None,
+                use_env_roots,
+                &scanner::ScannerSettings::default(),
+            )
+            .iter()
+            .map(|message| message.tokens.input)
+            .sum::<i64>()
+        };
+        assert_eq!(scan(true), 120);
+        env.set(
+            "TOKSCALE_EXCLUDED_CLAUDE_DIRS",
+            serde_json::to_string(&vec![&mirror]).unwrap(),
+        );
+        assert_eq!(
+            scan(true),
+            20,
+            "warm mirrors are excluded before aggregation"
+        );
+        assert_eq!(scan(false), 120, "an isolated home ignores the host policy");
+        env.remove("TOKSCALE_EXCLUDED_CLAUDE_DIRS");
+        assert_eq!(
+            scan(true),
+            120,
+            "source exclusion does not erase observations"
+        );
+        std::fs::write(&mirror_file, "{\"type\":\"assistant\",\"message\":").unwrap();
+        assert_eq!(scan(true), 120, "partial reads retain identified history");
+        std::fs::remove_file(&mirror_file).unwrap();
+        env.set(
+            "TOKSCALE_EXCLUDED_CLAUDE_DIRS",
+            serde_json::to_string(&vec![&mirror]).unwrap(),
+        );
+        assert_eq!(
+            scan(true),
+            20,
+            "missing-file retained history obeys the same selection"
+        );
+        env.remove("TOKSCALE_EXCLUDED_CLAUDE_DIRS");
+        assert_eq!(
+            scan(true),
+            120,
+            "retained history was filtered, not destroyed"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_remote_mirror_root_covers_live_and_retained_sources() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let _cache = redirect_cache_home(cache_home.path());
+        let mut env = crate::paths::test_env::EnvGuard::capture(&[
+            "CLAUDE_CONFIG_DIR",
+            "TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT",
+            "TOKSCALE_EXTRA_DIRS",
+        ]);
+        env.set("CLAUDE_CONFIG_DIR", home.path().join(".claude"));
+        env.remove("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT");
+        env.remove("TOKSCALE_EXTRA_DIRS");
+        let mirror = home
+            .path()
+            .join(".claude/projects/ssh-11111111-2222-4333-8444-555555555555");
+        let local = home.path().join(".claude/projects/local");
+        for dir in [&mirror, &local] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let row = |id: &str, input: i64| {
+            format!("{{\"type\":\"assistant\",\"timestamp\":\"2026-10-01T10:00:00Z\",\"sessionId\":\"{id}\",\"requestId\":\"req_{id}\",\"message\":{{\"id\":\"msg_{id}\",\"model\":\"claude-sonnet-4-6\",\"usage\":{{\"input_tokens\":{input},\"output_tokens\":0}}}}}}\n")
+        };
+        let mirror_file = mirror.join("session.jsonl");
+        std::fs::write(&mirror_file, row("session", 100)).unwrap();
+        std::fs::write(local.join("local.jsonl"), row("local", 20)).unwrap();
+        assert!(super::is_claude_ssh_mirror_directory(
+            "SSH-ABCDEFAB-1234-5678-ABCD-ABCDEFABCDEF"
+        ));
+        assert!(!super::is_claude_ssh_mirror_directory("ssh-my-project"));
+        assert!(!super::is_claude_ssh_mirror_directory(
+            "ssh-11111111-2222-4333-8444-555555555555-extra"
+        ));
+        let scan = |use_env_roots| {
+            parse_all_messages_with_pricing_with_env_strategy(
+                home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                None,
+                use_env_roots,
+                &scanner::ScannerSettings::default(),
+            )
+            .iter()
+            .map(|message| message.tokens.input)
+            .sum::<i64>()
+        };
+        assert_eq!(scan(true), 120);
+        env.set(
+            "TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT",
+            home.path().join(".claude/projects"),
+        );
+        assert_eq!(
+            scan(true),
+            20,
+            "warm mirrors are excluded before aggregation"
+        );
+        assert_eq!(scan(false), 120, "an isolated home ignores the host policy");
+        env.remove("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT");
+        assert_eq!(
+            scan(true),
+            120,
+            "source exclusion does not erase observations"
+        );
+        std::fs::write(&mirror_file, "{\"type\":\"assistant\",\"message\":").unwrap();
+        assert_eq!(scan(true), 120, "partial reads retain identified history");
+        std::fs::remove_file(&mirror_file).unwrap();
+        env.set(
+            "TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT",
+            home.path().join(".claude/projects"),
+        );
+        assert_eq!(
+            scan(true),
+            20,
+            "missing-file retained history obeys the same selection"
+        );
+        env.remove("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT");
+        assert_eq!(
+            scan(true),
+            120,
+            "retained history was filtered, not destroyed"
+        );
     }
 
     fn home_guard() -> crate::paths::test_env::EnvGuard {

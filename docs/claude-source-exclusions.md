@@ -1,0 +1,9 @@
+# Claude transcript source selection
+
+A caller can explicitly assign SSH sessions to remote Agents and omit the host mirrors. `TOKSCALE_EXCLUDED_CLAUDE_DIRS` is a JSON array of absolute directory paths. When environment roots are enabled, the Claude transcript lane excludes files below those directories from live parsing, frozen cached sources and retained missing-file history. Existing directories are also canonicalized for path aliases. Relative entries are ignored; an invalid JSON value selects no exclusions.
+
+This is source selection, not event deduplication. The caller must ensure the original sources are collected independently. The scanner does not discover WSL owners, choose the larger copy, or supplement an original from an excluded mirror. It does not delete cached observations. Removing the selection restores those observations. The selection applies to transcript files, not Desktop conversation IndexedDB records.
+
+An explicit `--home` ignores the selection, preserving isolated original-source scans. Model JSON and `graph` JSON advertise `claudeSourceExclusions: true`. Consumers must verify that contract before excluding another source from their aggregation. Source discovery and cache-loading behavior are otherwise unchanged; Windows UNC lifecycle behavior still requires native acceptance.
+
+`TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT` selects one absolute Claude projects root whose direct `ssh-<UUID>` subdirectories are excluded. UUIDs must have hexadecimal 8-4-4-4-12 form (case insensitive); arbitrary SSH project names remain included. This bounded input also filters retained and frozen source paths, so a caller need not transmit an unbounded directory list or keep deleted folders on disk. It has the same explicit-home isolation and model/graph acknowledgement as the directory selection. The caller opts into assigning all of these SSH mirrors to remote Agents; this is not automatic detection of WSL.
