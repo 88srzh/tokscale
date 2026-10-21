@@ -3404,7 +3404,7 @@ impl Drop for TestSourceCachePersistObserverGuard {
 pub(crate) struct SourceMessageCache {
     state: Mutex<CacheState>,
     frozen_claude_roots: Vec<PathBuf>,
-    claude_scan_paths: Option<HashSet<PathBuf>>,
+    claude_scan_roots: Option<Vec<PathBuf>>,
     /// `false` for [`SourceCachePolicy::InMemory`] callers, who must never
     /// touch the on-disk shards.
     persistent: bool,
@@ -3463,7 +3463,7 @@ impl SourceMessageCache {
         Self {
             state: Mutex::new(CacheState::default()),
             frozen_claude_roots: Vec::new(),
-            claude_scan_paths: None,
+            claude_scan_roots: None,
             persistent: true,
         }
     }
@@ -3472,20 +3472,25 @@ impl SourceMessageCache {
         self.frozen_claude_roots = roots.to_vec();
     }
 
-    pub(crate) fn restrict_claude_source_probes(&mut self, paths: &[PathBuf]) {
-        self.claude_scan_paths = Some(paths.iter().cloned().collect());
+    pub(crate) fn restrict_claude_source_probes(&mut self, roots: &[PathBuf]) {
+        self.claude_scan_roots = Some(roots.to_vec());
     }
 
     fn can_probe_source(&self, namespace: &str, path: &Path) -> bool {
         namespace != ClientId::Claude.as_str()
             || self
-                .claude_scan_paths
+                .claude_scan_roots
                 .as_ref()
-                .is_none_or(|paths| paths.contains(path))
+                .is_none_or(|roots| roots.iter().any(|root| path.starts_with(root)))
     }
 
     fn is_frozen_claude_path(&self, namespace: &str, path: &Path) -> bool {
         namespace == ClientId::Claude.as_str()
+            // An active scan owns deletion checks even when the caller also
+            // requests a cached fallback for this root.
+            && !self.claude_scan_roots.as_ref().is_some_and(|roots| {
+                roots.iter().any(|root| path.starts_with(root))
+            })
             && self
                 .frozen_claude_roots
                 .iter()
@@ -3604,7 +3609,7 @@ impl SourceMessageCache {
                 // an ordinary deleted session must stop contributing usage.
                 if self.can_probe_source(&key.namespace, &key.path.to_path_buf())
                     && !self.is_frozen_claude_path(&key.namespace, &key.path.to_path_buf())
-                    && !key.path.to_path_buf().exists()
+                    && matches!(key.path.to_path_buf().try_exists(), Ok(false))
                     && !entry.holds_retained_history()
                 {
                     state.deleted_keys.insert(key, DeletionReason::Missing);
@@ -3664,7 +3669,7 @@ impl SourceMessageCache {
                     && roots
                         .iter()
                         .any(|root| entry.path.to_path_buf().starts_with(root))
-                    && !entry.path.to_path_buf().exists()
+                    && matches!(entry.path.to_path_buf().try_exists(), Ok(false))
             })
             .cloned()
             .collect();
@@ -3695,6 +3700,7 @@ impl SourceMessageCache {
                     let path = entry.path.to_path_buf();
                     (entry.matches_identity(identity)
                         && roots.iter().any(|root| path.starts_with(root))
+                        && self.is_frozen_claude_path(identity.namespace, &path)
                         && !scanned.contains(&path))
                     .then_some(path)
                 })
@@ -3996,7 +4002,9 @@ impl SourceMessageCache {
                 if let Some(deleted) = deleted_by_shard.get(&shard_key) {
                     for (key, reason) in deleted {
                         let should_remove = match reason {
-                            DeletionReason::Missing => !key.path.to_path_buf().exists(),
+                            DeletionReason::Missing => {
+                                matches!(key.path.to_path_buf().try_exists(), Ok(false))
+                            }
                             DeletionReason::Invalidated(expected) => merged_entries
                                 .get(key)
                                 .is_some_and(|entry| entry.fingerprint == *expected),

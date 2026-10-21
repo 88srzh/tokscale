@@ -2470,8 +2470,8 @@ fn run_models_report(
         #[derive(serde::Serialize)]
         #[serde(rename_all = "camelCase")]
         struct ModelReportJson {
-            claude_source_exclusions: bool,
             group_by: String,
+            claude_source_exclusions: bool,
             claude_cached_roots: bool,
             entries: Vec<ModelUsageJson>,
             /// Per-session facts for session-grouped reports, joined by
