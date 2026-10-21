@@ -1015,6 +1015,22 @@ export async function POST(request: Request) {
         existingDeviceDays.map((d) => [d.date, d])
       );
 
+      // A date-bounded submit that declares per-client coverage ships its
+      // `fullHistoryClients` unfiltered (#1513), so the payload dates days
+      // every other scanned client was scoped out of. On a day carrying only
+      // declared-complete cells, another client's absence or a lower day
+      // active time says nothing about stored data — the merge preserves the
+      // stored values either way — so the per-day preserve notices are
+      // suppressed there. Full-history submits and CLIs predating the
+      // per-client declaration are unaffected.
+      const declaredFullHistoryClients = new Set(
+        data.scanScope?.fullHistory === false
+          ? (data.scanScope.fullHistoryClients ?? [])
+          : []
+      );
+      const windowScopedSubmission =
+        !isBackfill && declaredFullHistoryClients.size > 0;
+
       const daysToProcess = new Map(
         data.contributions.map((day) => [day.date, day] as const)
       );
@@ -1127,6 +1143,15 @@ export async function POST(request: Request) {
 
         const existingDay = existingDaysMap.get(incomingDay.date);
 
+        // True only for days whose every incoming cell belongs to a
+        // declared-complete client — the day class a bounded submit's
+        // date-filter exemption introduces outside the requested window.
+        const dayCoveredOnlyByDeclaredClients =
+          windowScopedSubmission &&
+          incomingDay.clients.every((contribution) =>
+            declaredFullHistoryClients.has(contribution.client)
+          );
+
         if (existingDay) {
           const rawExistingBreakdown = (existingDay.sourceBreakdown || {}) as Record<
             string,
@@ -1195,7 +1220,8 @@ export async function POST(request: Request) {
             incomingClientBreakdown,
             clientsToMerge,
             foldedClientFloors,
-            incomingDay.totals?.costIsComplete ?? true
+            incomingDay.totals?.costIsComplete ?? true,
+            dayCoveredOnlyByDeclaredClients
           );
           warnings.push(
             ...mergeResult.warnings.map((warning) => `Day ${incomingDay.date}: ${warning}`)
@@ -1203,7 +1229,12 @@ export async function POST(request: Request) {
           if (
             existingDay.activeTimeMs != null &&
             incomingDay.activeTimeMs != null &&
-            incomingDay.activeTimeMs < existingDay.activeTimeMs
+            incomingDay.activeTimeMs < existingDay.activeTimeMs &&
+            // Same suppression: outside the bounded window the day's incoming
+            // active time is structurally partial (only declared clients
+            // contribute), and the monotonic guard keeps the stored value
+            // regardless of this notice.
+            !dayCoveredOnlyByDeclaredClients
           ) {
             warnings.push(
               `Day ${incomingDay.date}: Preserved ${existingDay.activeTimeMs}ms active time because this same-device resubmit reported only ${incomingDay.activeTimeMs}ms.`
