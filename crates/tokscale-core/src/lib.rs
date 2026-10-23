@@ -1631,6 +1631,38 @@ fn is_claude_ssh_mirror_directory(name: &str) -> bool {
         })
 }
 
+// Resolve the policy once per parse, not per transcript. Both public parse
+// lanes must select the same live sources; only the streaming lane replays
+// frozen observations and retained history.
+fn claude_source_path_filter(use_env_roots: bool) -> impl Fn(&Path) -> bool {
+    // The caller owns source selection; this does not alter event deduplication
+    // or cached observations. Explicit --home reports are always isolated.
+    // A bounded root policy avoids an environment variable that grows by one
+    // path per SSH session. Match cached sources too, even after deletion.
+    let remote_mirror_roots: Vec<PathBuf> = if use_env_roots {
+        std::env::var_os("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT")
+            .map(PathBuf::from)
+            .filter(|root| root.is_absolute())
+            .into_iter()
+            .flat_map(|root| {
+                let canonical = std::fs::canonicalize(&root).ok();
+                std::iter::once(root).chain(canonical)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    move |path: &Path| {
+        !remote_mirror_roots.iter().any(|root| {
+            path.strip_prefix(root)
+                .ok()
+                .and_then(|relative| relative.components().next())
+                .and_then(|part| part.as_os_str().to_str())
+                .is_some_and(is_claude_ssh_mirror_directory)
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // price_window rides beside pricing through the shared loader chain
 fn parse_all_messages_streaming<S: MessageSink>(
     home_dir: &str,
@@ -3215,32 +3247,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
         flush_message(message, &flush_context, sink);
     }
 
-    // The caller owns source selection; this does not alter event deduplication
-    // or cached observations. Explicit --home reports are always isolated.
-    // A bounded root policy avoids an environment variable that grows by one
-    // path per SSH session. Match cached sources too, even after deletion.
-    let remote_mirror_roots: Vec<PathBuf> = if use_env_roots {
-        std::env::var_os("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT")
-            .map(PathBuf::from)
-            .filter(|root| root.is_absolute())
-            .into_iter()
-            .flat_map(|root| {
-                let canonical = std::fs::canonicalize(&root).ok();
-                std::iter::once(root).chain(canonical)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let include_claude_path = |path: &Path| {
-        !remote_mirror_roots.iter().any(|root| {
-            path.strip_prefix(root)
-                .ok()
-                .and_then(|relative| relative.components().next())
-                .and_then(|part| part.as_os_str().to_str())
-                .is_some_and(is_claude_ssh_mirror_directory)
-        })
-    };
+    let include_claude_path = claude_source_path_filter(use_env_roots);
     let claude_home = PathBuf::from(home_dir);
     let frozen_claude_sources = if include_all || clients.iter().any(|client| client == "claude") {
         source_cache.cached_claude_sources(&cached_claude_roots, scan_result.get(ClientId::Claude))
@@ -7283,10 +7290,12 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::MiMoDesktop, micode_desktop_count);
     messages.extend(micode_msgs);
 
+    let include_claude_path = claude_source_path_filter(options.use_env_roots);
     let claude_home = PathBuf::from(&home_dir);
     let claude_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Claude)
         .par_iter()
+        .filter(|path| include_claude_path(path))
         .map_init(std::collections::HashMap::new, |parent_cache, path| {
             sessions::claudecode::parse_claude_file_with_cache_and_home(
                 path,
@@ -10321,6 +10330,83 @@ mod tests {
             120,
             "retained history was filtered, not destroyed"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_remote_mirror_policy_matches_local_messages_and_counts() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let _cache = redirect_cache_home(cache_home.path());
+        let mut env = crate::paths::test_env::EnvGuard::capture(&[
+            "CLAUDE_CONFIG_DIR",
+            "TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT",
+            "TOKSCALE_EXTRA_DIRS",
+            "TOKSCALE_CACHED_CLAUDE_DIRS",
+        ]);
+        env.set("CLAUDE_CONFIG_DIR", home.path().join(".claude"));
+        env.remove("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT");
+        env.remove("TOKSCALE_EXTRA_DIRS");
+        env.remove("TOKSCALE_CACHED_CLAUDE_DIRS");
+        let projects = home.path().join(".claude/projects");
+        for (directory, id, tokens) in [
+            ("local", "local", 20),
+            ("ssh-11111111-2222-4333-8444-555555555555", "mirror", 100),
+            ("SSH-ABCDEFAB-1234-5678-ABCD-ABCDEFABCDEF", "uppercase", 200),
+            ("ssh-my-project", "named-project", 30),
+            (
+                "ssh-11111111-2222-4333-8444-555555555555-extra",
+                "suffix",
+                40,
+            ),
+        ] {
+            let dir = projects.join(directory);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join(format!("{id}.jsonl")),
+                claude_cache_fixture_row(id, tokens),
+            )
+            .unwrap();
+        }
+        let parse = |use_env_roots| {
+            parse_local_clients(LocalParseOptions {
+                home_dir: Some(home.path().to_str().unwrap().to_owned()),
+                use_env_roots,
+                clients: Some(vec!["claude".to_owned()]),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+            })
+            .unwrap()
+        };
+        let check = |use_env_roots, expected_tokens, expected_count| {
+            let parsed = parse(use_env_roots);
+            assert_eq!(
+                parsed
+                    .messages
+                    .iter()
+                    .map(|message| message.input)
+                    .sum::<i64>(),
+                expected_tokens
+            );
+            assert_eq!(parsed.messages.len(), expected_count);
+            assert_eq!(parsed.counts.get(ClientId::Claude), expected_count as i32);
+            assert_eq!(
+                claude_cache_fixture_total(home.path(), use_env_roots),
+                expected_tokens
+            );
+        };
+        check(true, 390, 5);
+        env.set("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT", &projects);
+        check(true, 90, 3);
+        assert!(parse(true)
+            .messages
+            .iter()
+            .all(|message| !matches!(message.session_id.as_str(), "mirror" | "uppercase")));
+        check(false, 390, 5);
+        env.remove("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT");
+        check(true, 390, 5);
     }
 
     fn home_guard() -> crate::paths::test_env::EnvGuard {
