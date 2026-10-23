@@ -1326,6 +1326,90 @@ mod tests {
     }
 
     #[test]
+    fn settings_round_trips_scanner_machine_labels_through_json() {
+        let json = r#"{
+            "scanner": {
+                "machineLabels": {
+                    "/mirrors/steven": "steven",
+                    "D:\\Mirrors\\Kev": "kev"
+                },
+                "localMachineLabel": "blade"
+            }
+        }"#;
+        let parsed: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.scanner.machine_labels.get("/mirrors/steven"),
+            Some(&"steven".to_string())
+        );
+        assert_eq!(
+            parsed.scanner.machine_labels.get("D:\\Mirrors\\Kev"),
+            Some(&"kev".to_string())
+        );
+        assert_eq!(parsed.scanner.local_machine_label.as_deref(), Some("blade"));
+
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(
+            serialized["scanner"]["machineLabels"]["/mirrors/steven"],
+            serde_json::json!("steven")
+        );
+        assert_eq!(
+            serialized["scanner"]["localMachineLabel"],
+            serde_json::json!("blade")
+        );
+        let round_trip: Settings = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            round_trip.scanner.machine_labels,
+            parsed.scanner.machine_labels
+        );
+        assert_eq!(
+            round_trip.scanner.local_machine_label,
+            parsed.scanner.local_machine_label
+        );
+    }
+
+    #[test]
+    fn settings_without_machine_labels_do_not_write_them() {
+        let serialized = serde_json::to_value(Settings::default()).unwrap();
+        assert!(serialized["scanner"].get("machineLabels").is_none());
+        assert!(serialized["scanner"].get("localMachineLabel").is_none());
+    }
+
+    #[test]
+    fn settings_malformed_machine_labels_do_not_wipe_other_fields() {
+        // A hand-edited typo in either key must not reset the scan paths, the
+        // other scanner keys, or the rest of the file.
+        let json = r#"{
+            "colorPalette": "custom",
+            "scanner": {
+                "extraScanPaths": { "codex": ["/mirrors/steven/.codex/sessions"] },
+                "machineLabels": ["oops"],
+                "localMachineLabel": 5
+            }
+        }"#;
+        let parsed: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.color_palette, "custom");
+        assert!(parsed.scanner.machine_labels.is_empty());
+        assert_eq!(parsed.scanner.local_machine_label, None);
+        assert_eq!(
+            parsed.scanner.extra_scan_paths["codex"],
+            vec![PathBuf::from("/mirrors/steven/.codex/sessions")]
+        );
+
+        // A non-string label drops only that entry.
+        let json = r#"{
+            "scanner": {
+                "machineLabels": { "/mirrors/steven": "steven", "/mirrors/kev": 7 }
+            }
+        }"#;
+        let parsed: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.scanner.machine_labels.len(), 1);
+        assert_eq!(
+            parsed.scanner.machine_labels.get("/mirrors/steven"),
+            Some(&"steven".to_string())
+        );
+    }
+
+    #[test]
     fn settings_default_clients_defaults_to_empty() {
         // Older settings.json files have no `defaultClients` key — they
         // must still parse and yield the "no defaults configured" state.

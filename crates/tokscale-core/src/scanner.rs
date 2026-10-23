@@ -79,6 +79,27 @@ pub struct ScannerSettings {
     /// An unparseable value degrades to unpinned rather than failing the scan.
     #[serde(default)]
     pub bucket_timezone: Option<String>,
+    /// Machine labels for session folders mirrored from other machines, as
+    /// `{ "<folder>": "<label>" }`.
+    ///
+    /// Every session file under a listed folder is attributed to that label,
+    /// so the `machine,model` grouping can split usage by machine. The longest
+    /// matching folder wins; see [`crate::machine_label`] for the matching
+    /// rules. A malformed value reads as empty instead of failing the load.
+    #[serde(
+        default,
+        deserialize_with = "crate::machine_label::deserialize_machine_labels_lossy",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub machine_labels: BTreeMap<String, String>,
+    /// Label for session files under no `machineLabels` folder. Unset means
+    /// [`crate::machine_label::DEFAULT_LOCAL_MACHINE_LABEL`].
+    #[serde(
+        default,
+        deserialize_with = "crate::machine_label::deserialize_local_machine_label_lossy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub local_machine_label: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

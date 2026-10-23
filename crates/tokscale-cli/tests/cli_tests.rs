@@ -5063,6 +5063,161 @@ fn test_models_group_by_workspace_model_uses_unknown_bucket_for_unsupported_clie
     }
 }
 
+/// Two mirrored Codex session folders added through `scanner.extraScanPaths`,
+/// one session each, and the settings that label them.
+fn write_machine_label_fixture(base: &Path, machine_labels: Option<&str>) {
+    let blade = base.join("mirrors/blade/.codex/sessions");
+    let steven = base.join("mirrors/steven/.codex/sessions");
+    write_codex_token_session(&blade, "blade.jsonl", "gpt-4o-mini", 100, 10);
+    write_codex_token_session(&steven, "steven.jsonl", "gpt-4o-mini", 200, 20);
+    let json_path = |path: &Path| serde_json::to_string(path.to_str().unwrap()).unwrap();
+    let labels = machine_labels
+        .map(|labels| format!(r#", {labels}"#))
+        .unwrap_or_default();
+    write_settings_json(
+        base,
+        &format!(
+            r#"{{
+                "scanner": {{
+                    "extraScanPaths": {{
+                        "codex": [{}, {}]
+                    }}{labels}
+                }}
+            }}"#,
+            json_path(&blade),
+            json_path(&steven),
+        ),
+    );
+}
+
+fn machine_model_rows(base: &Path) -> Vec<(String, String, i64)> {
+    let output = cmd_with_home(base)
+        .args([
+            "models",
+            "--json",
+            "--light",
+            "--client",
+            "codex",
+            "--no-spinner",
+            "--group-by",
+            "machine,model",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["groupBy"].as_str().unwrap(), "machine,model");
+    let mut rows: Vec<(String, String, i64)> = json["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["machine"].as_str().unwrap().to_string(),
+                entry["model"].as_str().unwrap().to_string(),
+                entry["input"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[test]
+fn test_models_group_by_machine_model_splits_rows_by_machine_label() {
+    let tmp = create_empty_fixture_dir();
+    let steven_root = tmp.path().join("mirrors/steven");
+    write_machine_label_fixture(
+        tmp.path(),
+        Some(&format!(
+            r#""machineLabels": {{ {}: "steven" }}"#,
+            serde_json::to_string(steven_root.to_str().unwrap()).unwrap()
+        )),
+    );
+
+    assert_eq!(
+        machine_model_rows(tmp.path()),
+        vec![
+            ("local".to_string(), "gpt-4o-mini".to_string(), 100),
+            ("steven".to_string(), "gpt-4o-mini".to_string(), 200),
+        ]
+    );
+}
+
+#[test]
+fn test_models_group_by_machine_model_is_all_local_without_machine_labels() {
+    let tmp = create_empty_fixture_dir();
+    write_machine_label_fixture(tmp.path(), None);
+
+    assert_eq!(
+        machine_model_rows(tmp.path()),
+        vec![("local".to_string(), "gpt-4o-mini".to_string(), 300)]
+    );
+}
+
+#[test]
+fn test_models_group_by_machine_model_uses_the_configured_local_label() {
+    let tmp = create_empty_fixture_dir();
+    let steven_root = tmp.path().join("mirrors/steven");
+    write_machine_label_fixture(
+        tmp.path(),
+        Some(&format!(
+            r#""machineLabels": {{ {}: "steven" }}, "localMachineLabel": "blade""#,
+            serde_json::to_string(steven_root.to_str().unwrap()).unwrap()
+        )),
+    );
+
+    assert_eq!(
+        machine_model_rows(tmp.path()),
+        vec![
+            ("blade".to_string(), "gpt-4o-mini".to_string(), 100),
+            ("steven".to_string(), "gpt-4o-mini".to_string(), 200),
+        ]
+    );
+}
+
+#[test]
+fn test_models_group_by_machine_model_table_shows_a_machine_column() {
+    let tmp = create_empty_fixture_dir();
+    let steven_root = tmp.path().join("mirrors/steven");
+    write_machine_label_fixture(
+        tmp.path(),
+        Some(&format!(
+            r#""machineLabels": {{ {}: "steven" }}"#,
+            serde_json::to_string(steven_root.to_str().unwrap()).unwrap()
+        )),
+    );
+
+    cmd_with_home(tmp.path())
+        .args(["models", "--light", "--client", "codex", "--no-spinner"])
+        .args(["--group-by", "machine-model"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Machine"))
+        .stdout(predicate::str::contains("steven"))
+        .stdout(predicate::str::contains("local"));
+}
+
+#[test]
+fn test_models_group_by_other_modes_omit_the_machine_field() {
+    let tmp = create_empty_fixture_dir();
+    write_machine_label_fixture(tmp.path(), None);
+    let output = cmd_with_home(tmp.path())
+        .args(["models", "--json", "--client", "codex", "--no-spinner"])
+        .args(["--group-by", "model"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for entry in json["entries"].as_array().unwrap() {
+        assert!(entry.get("machine").is_none(), "{entry}");
+    }
+}
+
 #[test]
 fn test_models_group_by_workspace_model_surfaces_workspace_fields_for_qwen() {
     let tmp = create_qwen_workspace_fixture_dir();

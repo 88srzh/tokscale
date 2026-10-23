@@ -93,7 +93,7 @@ struct Cli {
         long,
         value_name = "STRATEGY",
         default_value = "client,model",
-        help = "Grouping strategy for --light and --json output: model, client,model, client,provider,model, workspace,model, session,model, client,session,model"
+        help = "Grouping strategy for --light and --json output: model, client,model, client,provider,model, workspace,model, session,model, client,session,model, machine,model"
     )]
     group_by: String,
 
@@ -125,7 +125,7 @@ enum Commands {
             long,
             value_name = "STRATEGY",
             default_value = "client,model",
-            help = "Grouping strategy for --light and --json output: model, client,model, client,provider,model, workspace,model, session,model, client,session,model"
+            help = "Grouping strategy for --light and --json output: model, client,model, client,provider,model, workspace,model, session,model, client,session,model, machine,model"
         )]
         group_by: String,
         #[arg(
@@ -2417,6 +2417,8 @@ fn run_models_report(
             workspace_label: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             session_id: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            machine: Option<String>,
             model: String,
             provider: String,
             input: i64,
@@ -2472,6 +2474,11 @@ fn run_models_report(
                     },
                     session_id: if matches!(group_by, GroupBy::Session | GroupBy::ClientSession) {
                         e.session_id
+                    } else {
+                        None
+                    },
+                    machine: if group_by == GroupBy::MachineModel {
+                        e.machine
                     } else {
                         None
                     },
@@ -2536,6 +2543,22 @@ fn run_models_report(
         table.enforce_styling();
 
         let workspace_name = |label: Option<&str>| label.unwrap_or("Unknown workspace").to_string();
+        // `workspace,model` and `machine,model` share one layout; only the
+        // first column differs.
+        let label_header = if group_by == GroupBy::MachineModel {
+            "Machine"
+        } else {
+            "Workspace"
+        };
+        let row_label = |entry: &tokscale_core::ModelUsage| {
+            if group_by == GroupBy::MachineModel {
+                entry.machine.clone().unwrap_or_else(|| {
+                    tokscale_core::machine_label::DEFAULT_LOCAL_MACHINE_LABEL.to_string()
+                })
+            } else {
+                workspace_name(entry.workspace_label.as_deref())
+            }
+        };
 
         if compact {
             match group_by {
@@ -2755,9 +2778,9 @@ fn run_models_report(
                     );
                     table.add_row(total_row);
                 }
-                GroupBy::WorkspaceModel => {
+                GroupBy::WorkspaceModel | GroupBy::MachineModel => {
                     table.set_header(vec![
-                        Cell::new("Workspace").fg(Color::Cyan),
+                        Cell::new(label_header).fg(Color::Cyan),
                         Cell::new("Model").fg(Color::Cyan),
                         Cell::new("ms/1K").fg(Color::Cyan),
                         Cell::new("Cost").fg(Color::Cyan),
@@ -2765,7 +2788,7 @@ fn run_models_report(
 
                     for entry in &report.entries {
                         table.add_row(vec![
-                            Cell::new(workspace_name(entry.workspace_label.as_deref())),
+                            Cell::new(row_label(entry)),
                             Cell::new(&entry.model),
                             Cell::new(format_ms_per_1k(entry.performance.ms_per_1k_tokens))
                                 .set_alignment(CellAlignment::Right),
@@ -3070,9 +3093,9 @@ fn run_models_report(
                             .set_alignment(CellAlignment::Right),
                     ]);
                 }
-                GroupBy::WorkspaceModel => {
+                GroupBy::WorkspaceModel | GroupBy::MachineModel => {
                     table.set_header(vec![
-                        Cell::new("Workspace").fg(Color::Cyan),
+                        Cell::new(label_header).fg(Color::Cyan),
                         Cell::new("Providers").fg(Color::Cyan),
                         Cell::new("Sources").fg(Color::Cyan),
                         Cell::new("Model").fg(Color::Cyan),
@@ -3100,7 +3123,7 @@ fn run_models_report(
                             .join(", ");
 
                         table.add_row(vec![
-                            Cell::new(workspace_name(entry.workspace_label.as_deref())),
+                            Cell::new(row_label(entry)),
                             Cell::new(crate::tui::ui::widgets::get_provider_display_name(
                                 &entry.provider,
                             ))
@@ -8372,6 +8395,7 @@ mod tests {
             workspace_key: None,
             workspace_label: None,
             session_id: None,
+            machine: None,
             model: "gemini-3-pro".to_string(),
             provider: "antigravity".to_string(),
             input: i64::MAX,
@@ -8396,6 +8420,7 @@ mod tests {
             workspace_key: None,
             workspace_label: None,
             session_id: None,
+            machine: None,
             model: "gemini-3-pro".to_string(),
             provider: "antigravity".to_string(),
             input: i64::MAX,
