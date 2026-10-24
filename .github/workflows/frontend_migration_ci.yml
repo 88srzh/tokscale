@@ -12,6 +12,8 @@ on:
       - "packages/frontend/drizzle.config.ts"
       - "packages/frontend/scripts/check-migrations.ts"
       - "packages/frontend/src/lib/db/**"
+      - "packages/frontend/src/lib/groups/invites.ts"
+      - "packages/frontend/__tests__/integration/groupInvitesPostgres.test.ts"
       - "packages/frontend/src/lib/leaderboard/getLeaderboard.ts"
       - "packages/frontend/__tests__/integration/leaderboardPostgres.test.ts"
       - "packages/frontend/__tests__/integration/profileRanksPostgres.test.ts"
@@ -95,6 +97,11 @@ jobs:
         env:
           LEADERBOARD_TOTALS_DB_INTEGRATION: "1"
         run: bun run --cwd packages/frontend test:leaderboard:db
+
+      - name: Exercise concurrent group invitation transactions
+        env:
+          GROUP_INVITES_DB_INTEGRATION: "1"
+        run: bun run --cwd packages/frontend test -- __tests__/integration/groupInvitesPostgres.test.ts
 
       - name: Compare public ranking surfaces against PostgreSQL
         env:
