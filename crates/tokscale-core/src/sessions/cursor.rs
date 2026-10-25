@@ -431,7 +431,9 @@ fn cursor_usage_event_id(row: &serde_json::Value) -> Option<String> {
 /// UTC-stable synthetic per-day id so their cost is never dropped from totals.
 ///
 /// Rows sharing a `usageEventId` are snapshots of one event, not independent
-/// events, so only the latest snapshot of each id is kept.
+/// events, so only the snapshot with the largest `(token total, cost)` is kept.
+/// An id-less legacy row with the same parsed session, model, and timestamp as
+/// an identified row competes with that event's snapshots under the same rule.
 pub fn parse_cursor_events_json(path: &Path) -> Vec<UnifiedMessage> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -532,9 +534,11 @@ pub fn parse_cursor_events_json(path: &Path) -> Vec<UnifiedMessage> {
 /// while the token counts grow, so summing every row counts one event many
 /// times over.
 ///
-/// The surviving row is the one with the largest token total, which is also
-/// the row with the largest cost (the metered cents grow with the tokens).
-/// Rows without a `usageEventId` carry no event identity and are all kept.
+/// The surviving row is chosen by lexicographic maximum `(token total, cost)`.
+/// An id-less legacy row with the same parsed session id, model, and timestamp
+/// as an identified row competes with that event's snapshots. This retains the
+/// largest observed usage instead of dropping a possibly larger legacy snapshot.
+/// All id-less rows without an identified match are kept.
 fn dedupe_cursor_event_snapshots(
     messages: Vec<UnifiedMessage>,
     snapshot_ids: Vec<Option<String>>,
@@ -543,28 +547,59 @@ fn dedupe_cursor_event_snapshots(
         return messages;
     }
 
+    // Associate legacy id-less snapshots with an identified row using only the
+    // normalized message fields parsed from the same raw identity fields. If
+    // more than one event id has the same fallback identity, choose one
+    // deterministically without merging the distinct identified events.
+    let mut identified_by_fallback: HashMap<(String, String, i64), String> = HashMap::new();
+    for (message, snapshot_id) in messages.iter().zip(&snapshot_ids) {
+        let Some(snapshot_id) = snapshot_id.as_ref() else {
+            continue;
+        };
+        identified_by_fallback
+            .entry((
+                message.session_id.clone(),
+                message.model_id.clone(),
+                message.timestamp,
+            ))
+            .and_modify(|current| {
+                if snapshot_id < current {
+                    current.clone_from(snapshot_id);
+                }
+            })
+            .or_insert_with(|| snapshot_id.clone());
+    }
+
     // The index of the surviving row per event id, and the set of rows that a
-    // later, larger snapshot of the same event supersedes.
+    // larger snapshot of the same event supersedes.
     let mut surviving: HashMap<String, usize> = HashMap::new();
     let mut superseded = vec![false; messages.len()];
 
     for (index, snapshot_id) in snapshot_ids.iter().enumerate() {
-        let Some(snapshot_id) = snapshot_id.as_deref() else {
+        let fallback_key = (
+            messages[index].session_id.clone(),
+            messages[index].model_id.clone(),
+            messages[index].timestamp,
+        );
+        let Some(snapshot_id) = snapshot_id
+            .as_ref()
+            .or_else(|| identified_by_fallback.get(&fallback_key))
+        else {
             continue;
         };
         match surviving.get(snapshot_id).copied() {
             Some(current) => {
-                let newer = (messages[index].tokens.total(), messages[index].cost)
+                let is_larger = (messages[index].tokens.total(), messages[index].cost)
                     > (messages[current].tokens.total(), messages[current].cost);
-                if newer {
+                if is_larger {
                     superseded[current] = true;
-                    surviving.insert(snapshot_id.to_string(), index);
+                    surviving.insert(snapshot_id.clone(), index);
                 } else {
                     superseded[index] = true;
                 }
             }
             None => {
-                surviving.insert(snapshot_id.to_string(), index);
+                surviving.insert(snapshot_id.clone(), index);
             }
         }
     }
@@ -789,8 +824,39 @@ mod tests {
         assert_eq!(parse_cursor_file_call_count(sibling.path()), 1);
     }
 
+    fn cursor_snapshot_row(
+        timestamp: i64,
+        usage_event_id: Option<&str>,
+        input_tokens: i64,
+        charged_cents: f64,
+    ) -> serde_json::Value {
+        let mut row = serde_json::json!({
+            "timestamp": timestamp.to_string(),
+            "model": "gpt-5",
+            "chargedCents": charged_cents,
+            "tokenUsage": {
+                "inputTokens": input_tokens,
+                "outputTokens": 0,
+                "totalCents": charged_cents,
+            },
+            "conversationId": "same-conversation",
+        });
+        if let Some(usage_event_id) = usage_event_id {
+            row["usageEventId"] = serde_json::json!(usage_event_id);
+        }
+        row
+    }
+
+    fn parse_cursor_snapshot_rows(rows: Vec<serde_json::Value>) -> Vec<UnifiedMessage> {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("usage.json");
+        let json = serde_json::json!({"usageEventsDisplay": rows});
+        std::fs::write(&file_path, serde_json::to_vec(&json).unwrap()).unwrap();
+        parse_cursor_file(&file_path)
+    }
+
     #[test]
-    fn test_parse_cursor_events_json_keeps_only_the_latest_snapshot_per_event() {
+    fn test_parse_cursor_events_json_keeps_only_the_largest_snapshot_per_event() {
         // Cursor's usage-events payload reports one event repeatedly, with its
         // running token totals. The rows share a `usageEventId` and a
         // timestamp, so summing them would count the event many times over.
@@ -851,9 +917,108 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cursor_events_json_matches_idless_snapshot_to_identified_event() {
+        let idless = cursor_snapshot_row(1_792_841_120_156, None, 10, 1.0);
+        let identified = cursor_snapshot_row(
+            1_792_841_120_156,
+            Some("452fb2c1-c17e-4a0f-9b99-95a98967cfed"),
+            20,
+            2.0,
+        );
+
+        let messages = parse_cursor_snapshot_rows(vec![idless, identified]);
+
+        assert_eq!(messages.len(), 1, "one event must yield one message");
+        assert_eq!(messages[0].tokens.input, 20);
+        assert!((messages[0].cost - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_cursor_events_json_matches_idless_snapshot_after_identified_event() {
+        let identified = cursor_snapshot_row(
+            1_792_841_120_156,
+            Some("452fb2c1-c17e-4a0f-9b99-95a98967cfed"),
+            20,
+            2.0,
+        );
+        let idless = cursor_snapshot_row(1_792_841_120_156, None, 10, 1.0);
+
+        let messages = parse_cursor_snapshot_rows(vec![identified, idless]);
+
+        assert_eq!(
+            messages.len(),
+            1,
+            "row order must not change the event count"
+        );
+        assert_eq!(messages[0].tokens.input, 20);
+        assert!((messages[0].cost - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_cursor_events_json_keeps_larger_idless_snapshot_for_synthetic_session() {
+        let mut idless = cursor_snapshot_row(1_792_841_120_156, None, 30, 3.0);
+        let mut identified = cursor_snapshot_row(
+            1_792_841_120_156,
+            Some("452fb2c1-c17e-4a0f-9b99-95a98967cfed"),
+            20,
+            2.0,
+        );
+        idless.as_object_mut().unwrap().remove("conversationId");
+        identified.as_object_mut().unwrap().remove("conversationId");
+
+        let messages = parse_cursor_snapshot_rows(vec![idless, identified]);
+
+        assert_eq!(messages.len(), 1, "one event must yield one message");
+        assert_eq!(messages[0].tokens.input, 30);
+        assert!(messages[0].session_id.starts_with("cursor-active-"));
+    }
+
+    #[test]
+    fn test_parse_cursor_events_json_keeps_idless_snapshot_at_a_distinct_timestamp() {
+        let identified = cursor_snapshot_row(
+            1_792_841_120_156,
+            Some("452fb2c1-c17e-4a0f-9b99-95a98967cfed"),
+            20,
+            2.0,
+        );
+        let matching_idless = cursor_snapshot_row(1_792_841_120_156, None, 10, 1.0);
+        let distinct_idless = cursor_snapshot_row(1_792_841_120_157, None, 7, 0.7);
+
+        let messages =
+            parse_cursor_snapshot_rows(vec![identified, matching_idless, distinct_idless]);
+
+        assert_eq!(messages.len(), 2, "the unmatched id-less event must remain");
+        assert!(messages.iter().any(|message| {
+            message.timestamp == 1_792_841_120_157 && message.tokens.input == 7
+        }));
+    }
+
+    #[test]
+    fn test_parse_cursor_events_json_later_lower_snapshot_does_not_replace_larger() {
+        let larger = cursor_snapshot_row(
+            1_792_841_120_156,
+            Some("452fb2c1-c17e-4a0f-9b99-95a98967cfed"),
+            100,
+            10.0,
+        );
+        let later_but_lower = cursor_snapshot_row(
+            1_792_841_120_156,
+            Some("452fb2c1-c17e-4a0f-9b99-95a98967cfed"),
+            20,
+            2.0,
+        );
+
+        let messages = parse_cursor_snapshot_rows(vec![larger, later_but_lower]);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 100);
+        assert!((messages[0].cost - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
     fn test_parse_cursor_events_json_keeps_rows_without_an_event_id() {
-        // Rows without a `usageEventId` carry no event identity, so they are
-        // all kept — they are independent events.
+        // Id-less rows without any identified session/model/timestamp match
+        // carry no event identity, so they are all kept as independent events.
         let json = r#"{
             "usageEventsDisplay": [
                 {
