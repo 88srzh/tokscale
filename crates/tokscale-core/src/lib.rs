@@ -1634,7 +1634,10 @@ fn is_claude_ssh_mirror_directory(name: &str) -> bool {
 // Resolve the policy once per parse, not per transcript. Both public parse
 // lanes must select the same live sources; only the streaming lane replays
 // frozen observations and retained history.
-fn claude_source_path_filter(use_env_roots: bool) -> impl Fn(&Path) -> bool {
+fn claude_source_path_filter(
+    use_env_roots: bool,
+    root_aliases: &[(PathBuf, PathBuf)],
+) -> impl Fn(&Path) -> bool + '_ {
     // The caller owns source selection; this does not alter event deduplication
     // or cached observations. Explicit --home reports are always isolated.
     // A bounded root policy avoids an environment variable that grows by one
@@ -1652,14 +1655,26 @@ fn claude_source_path_filter(use_env_roots: bool) -> impl Fn(&Path) -> bool {
     } else {
         Vec::new()
     };
-    move |path: &Path| {
-        !remote_mirror_roots.iter().any(|root| {
+    let enabled = !remote_mirror_roots.is_empty();
+    let is_mirror = move |path: &Path| {
+        remote_mirror_roots.iter().any(|root| {
             path.strip_prefix(root)
                 .ok()
                 .and_then(|relative| relative.components().next())
                 .and_then(|part| part.as_os_str().to_str())
                 .is_some_and(is_claude_ssh_mirror_directory)
         })
+    };
+    move |path: &Path| {
+        !enabled
+            || (!is_mirror(path)
+            // Reuse evidence from the active scan. Do not canonicalize cached
+            // source paths: probing an offline UNC root could start its distro.
+            && !root_aliases.iter().any(|(alias, canonical)| {
+                path.strip_prefix(alias)
+                    .ok()
+                    .is_some_and(|relative| is_mirror(&canonical.join(relative)))
+            }))
     }
 }
 
@@ -3247,9 +3262,12 @@ fn parse_all_messages_streaming<S: MessageSink>(
         flush_message(message, &flush_context, sink);
     }
 
-    let include_claude_path = claude_source_path_filter(use_env_roots);
+    let include_claude_path =
+        claude_source_path_filter(use_env_roots, &scan_result.claude_root_aliases);
     let claude_home = PathBuf::from(home_dir);
-    let frozen_claude_sources = if include_all || clients.iter().any(|client| client == "claude") {
+    let frozen_claude_sources = if include_synthetic
+        || clients.iter().any(|client| client == "claude")
+    {
         source_cache.cached_claude_sources(&cached_claude_roots, scan_result.get(ClientId::Claude))
     } else {
         Vec::new()
@@ -7290,7 +7308,8 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::MiMoDesktop, micode_desktop_count);
     messages.extend(micode_msgs);
 
-    let include_claude_path = claude_source_path_filter(options.use_env_roots);
+    let include_claude_path =
+        claude_source_path_filter(options.use_env_roots, &scan_result.claude_root_aliases);
     let claude_home = PathBuf::from(&home_dir);
     let claude_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Claude)
@@ -10407,6 +10426,140 @@ mod tests {
         check(false, 390, 5);
         env.remove("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT");
         check(true, 390, 5);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn claude_selection_cached_sources_include_synthetic_only() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let remote = tempfile::TempDir::new().unwrap();
+        let _cache = redirect_cache_home(cache_home.path());
+        let mut env = crate::paths::test_env::EnvGuard::capture(&[
+            "CLAUDE_CONFIG_DIR",
+            "TOKSCALE_EXTRA_DIRS",
+            "TOKSCALE_CACHED_CLAUDE_DIRS",
+            "TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT",
+        ]);
+        env.set("CLAUDE_CONFIG_DIR", home.path().join(".claude"));
+        env.remove("TOKSCALE_CACHED_CLAUDE_DIRS");
+        env.remove("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT");
+        let root = remote.path().join("projects");
+        let project = root.join("ssh-11111111-2222-4333-8444-555555555555");
+        std::fs::create_dir_all(&project).unwrap();
+        let source = project.join("session.jsonl");
+        let gateway = claude_cache_fixture_row("gateway", 100)
+            .replace("claude-sonnet-4-6", "hf:deepseek-ai/DeepSeek-V3");
+        std::fs::write(
+            &source,
+            format!("{}{}", gateway, claude_cache_fixture_row("ordinary", 20)),
+        )
+        .unwrap();
+        env.set("TOKSCALE_EXTRA_DIRS", format!("claude:{}", root.display()));
+        let scan = |clients: &[&str], use_env_roots| {
+            parse_all_messages_with_pricing_with_env_strategy(
+                home.path().to_str().unwrap(),
+                &clients
+                    .iter()
+                    .map(|client| client.to_string())
+                    .collect::<Vec<_>>(),
+                None,
+                use_env_roots,
+                &scanner::ScannerSettings::default(),
+            )
+            .iter()
+            .map(|message| message.tokens.input)
+            .sum::<i64>()
+        };
+        assert_eq!(scan(&[], true), 120);
+        assert_eq!(scan(&["synthetic"], true), 100);
+        env.set(
+            "TOKSCALE_CACHED_CLAUDE_DIRS",
+            serde_json::to_string(&[&root]).unwrap(),
+        );
+        env.remove("TOKSCALE_EXTRA_DIRS");
+        std::fs::remove_file(&source).unwrap();
+        assert_eq!(scan(&["claude"], true), 120);
+        assert_eq!(
+            scan(&["synthetic"], true),
+            100,
+            "frozen gateway usage survives the client filter"
+        );
+        assert_eq!(scan(&[], true), 120);
+        assert_eq!(
+            scan(&["synthetic"], false),
+            0,
+            "explicit home ignores frozen roots"
+        );
+        env.set("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT", &root);
+        assert_eq!(
+            scan(&["synthetic"], true),
+            0,
+            "mirror policy also applies to gateway usage"
+        );
+        env.remove("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT");
+        assert_eq!(
+            scan(&["synthetic"], true),
+            100,
+            "selection never destroys frozen observations"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn claude_selection_mirror_filter_uses_active_root_aliases() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let real = tempfile::TempDir::new().unwrap();
+        let _cache = redirect_cache_home(cache_home.path());
+        let mut env = crate::paths::test_env::EnvGuard::capture(&[
+            "CLAUDE_CONFIG_DIR",
+            "TOKSCALE_EXTRA_DIRS",
+            "TOKSCALE_CACHED_CLAUDE_DIRS",
+            "TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT",
+        ]);
+        let alias = home.path().join(".claude");
+        std::os::unix::fs::symlink(real.path(), &alias).unwrap();
+        env.set("CLAUDE_CONFIG_DIR", &alias);
+        env.remove("TOKSCALE_EXTRA_DIRS");
+        env.remove("TOKSCALE_CACHED_CLAUDE_DIRS");
+        env.remove("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT");
+        let root = real.path().join("projects");
+        let mirror = root.join("ssh-11111111-2222-4333-8444-555555555555/session.jsonl");
+        let native = root.join("native/session.jsonl");
+        for (file, id, input) in [(&mirror, "mirror", 100), (&native, "native", 20)] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, claude_cache_fixture_row(id, input)).unwrap();
+        }
+        assert_eq!(claude_cache_fixture_total(home.path(), true), 120);
+        env.set("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT", &root);
+        assert_eq!(claude_cache_fixture_total(home.path(), true), 20);
+        let local = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.path().to_str().unwrap().to_owned()),
+            use_env_roots: true,
+            clients: Some(vec!["claude".to_owned()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+        assert_eq!(local.counts.get(ClientId::Claude), 1);
+        assert_eq!(claude_cache_fixture_total(home.path(), false), 120);
+        // Cached-only roots retain their lexical contract. Removing the alias
+        // makes filesystem resolution impossible, but replay and exclusion must
+        // still work when the caller supplies that same stored spelling.
+        env.set(
+            "TOKSCALE_CACHED_CLAUDE_DIRS",
+            serde_json::to_string(&[alias.join("projects")]).unwrap(),
+        );
+        env.set("CLAUDE_CONFIG_DIR", home.path().join("other"));
+        std::fs::remove_file(&alias).unwrap();
+        env.set("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT", alias.join("projects"));
+        assert_eq!(claude_cache_fixture_total(home.path(), true), 20);
+        env.remove("TOKSCALE_CLAUDE_REMOTE_MIRROR_ROOT");
+        assert_eq!(claude_cache_fixture_total(home.path(), true), 120);
     }
 
     fn home_guard() -> crate::paths::test_env::EnvGuard {

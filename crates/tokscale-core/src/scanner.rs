@@ -94,6 +94,8 @@ pub struct ScanResult {
     pub files: [Vec<PathBuf>; ClientId::COUNT],
     /// Roots actually selected for Claude scanning, including empty roots.
     pub claude_scan_roots: Vec<PathBuf>,
+    /// Alias and canonical pairs learned only from actively scanned roots.
+    pub claude_root_aliases: Vec<(PathBuf, PathBuf)>,
     /// All OpenCode SQLite databases discovered under the data dir.
     ///
     /// Includes the default `opencode.db` (used by `latest`/`beta` channels
@@ -144,6 +146,7 @@ impl Default for ScanResult {
         Self {
             files: std::array::from_fn(|_| Vec::new()),
             claude_scan_roots: Vec::new(),
+            claude_root_aliases: Vec::new(),
             opencode_dbs: Vec::new(),
             copilot_desktop_db: None,
             copilot_session_store_db: None,
@@ -3093,6 +3096,11 @@ fn scan_all_clients_with_env_strategy_inner(
         if client_id == ClientId::Claude {
             let root = PathBuf::from(&root);
             if let Ok(canonical) = std::fs::canonicalize(&root) {
+                if canonical != root {
+                    result
+                        .claude_root_aliases
+                        .push((root.clone(), canonical.clone()));
+                }
                 result.claude_scan_roots.push(canonical);
             }
             result.claude_scan_roots.push(root);
