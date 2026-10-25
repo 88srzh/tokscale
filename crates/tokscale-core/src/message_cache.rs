@@ -3405,6 +3405,7 @@ pub(crate) struct SourceMessageCache {
     state: Mutex<CacheState>,
     frozen_claude_roots: Vec<PathBuf>,
     claude_scan_roots: Option<Vec<PathBuf>>,
+    claude_failed_paths: Vec<PathBuf>,
     /// `false` for [`SourceCachePolicy::InMemory`] callers, who must never
     /// touch the on-disk shards.
     persistent: bool,
@@ -3464,6 +3465,7 @@ impl SourceMessageCache {
             state: Mutex::new(CacheState::default()),
             frozen_claude_roots: Vec::new(),
             claude_scan_roots: None,
+            claude_failed_paths: Vec::new(),
             persistent: true,
         }
     }
@@ -3472,25 +3474,37 @@ impl SourceMessageCache {
         self.frozen_claude_roots = roots.to_vec();
     }
 
-    pub(crate) fn restrict_claude_source_probes(&mut self, roots: &[PathBuf]) {
+    pub(crate) fn restrict_claude_source_probes(
+        &mut self,
+        roots: &[PathBuf],
+        failed_paths: &[PathBuf],
+    ) {
         self.claude_scan_roots = Some(roots.to_vec());
+        self.claude_failed_paths = failed_paths.to_vec();
+    }
+
+    fn claude_path_failed(&self, path: &Path) -> bool {
+        self.claude_failed_paths
+            .iter()
+            .any(|failed| path.starts_with(failed))
     }
 
     fn can_probe_source(&self, namespace: &str, path: &Path) -> bool {
         namespace != ClientId::Claude.as_str()
-            || self
-                .claude_scan_roots
-                .as_ref()
-                .is_none_or(|roots| roots.iter().any(|root| path.starts_with(root)))
+            || (!self.claude_path_failed(path)
+                && self
+                    .claude_scan_roots
+                    .as_ref()
+                    .is_none_or(|roots| roots.iter().any(|root| path.starts_with(root))))
     }
 
     fn is_frozen_claude_path(&self, namespace: &str, path: &Path) -> bool {
         namespace == ClientId::Claude.as_str()
-            // An active scan owns deletion checks even when the caller also
-            // requests a cached fallback for this root.
-            && !self.claude_scan_roots.as_ref().is_some_and(|roots| {
+            // Only a successful scan owns deletion checks. Failed traversal
+            // keeps the explicitly requested fallback even within active roots.
+            && (self.claude_path_failed(path) || !self.claude_scan_roots.as_ref().is_some_and(|roots| {
                 roots.iter().any(|root| path.starts_with(root))
-            })
+            }))
             && self
                 .frozen_claude_roots
                 .iter()
@@ -12917,6 +12931,57 @@ mod tests {
             reloaded.save_if_dirty();
             assert!(SourceMessageCache::load().get(identity, &path).is_none());
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_claude_subtree_replays_only_selected_cache_and_defers_pruning() {
+        let home = TempDir::new().unwrap();
+        let _env = sandbox_cache_env(home.path());
+        let sources = TempDir::new().unwrap();
+        let failed = sources.path().join("failed");
+        std::fs::create_dir(&failed).unwrap();
+        let path = failed.join("session.jsonl");
+        let gone = sources.path().join("gone.jsonl");
+        std::fs::write(&path, b"source").unwrap();
+        std::fs::write(&gone, b"source").unwrap();
+        let identity = CacheIdentity::for_client(ClientId::Claude);
+        let mut initial = SourceMessageCache::load();
+        for (source, id) in [(&path, "unreadable"), (&gone, "deleted")] {
+            let mut entry = test_entry(identity, source, id);
+            entry.fallback_timestamp_indices = vec![CLAUDE_RETENTION_PROVENANCE_MARKER];
+            assert!(!entry.holds_retained_history());
+            initial.insert(entry);
+        }
+        initial.save_if_dirty();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        let roots = vec![sources.path().to_path_buf()];
+        let mut cache = SourceMessageCache::load();
+        cache.freeze_claude_roots(&roots);
+        cache.restrict_claude_source_probes(&roots, &[failed]);
+        let fallback = cache.cached_claude_sources(&roots, &[]);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].path.to_path_buf(), path);
+        assert!(
+            cache.get(identity, &gone).is_none(),
+            "readable sibling still prunes"
+        );
+        assert!(
+            cache.cached_claude_sources(&[], &[]).is_empty(),
+            "unselected cache cannot enter reports"
+        );
+        cache.save_if_dirty();
+        let mut retry = SourceMessageCache::load();
+        retry.freeze_claude_roots(&roots);
+        retry.restrict_claude_source_probes(&roots, &[]);
+        assert!(retry.cached_claude_sources(&roots, &[]).is_empty());
+        assert!(
+            retry.get(identity, &path).is_none(),
+            "successful retry confirms deletion"
+        );
+        retry.save_if_dirty();
+        assert!(SourceMessageCache::load().get(identity, &path).is_none());
     }
 
     #[test]

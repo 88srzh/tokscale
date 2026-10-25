@@ -3141,7 +3141,10 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // A shared namespace can contain other homes. Merely loading it must not
     // probe or prune those sources, especially offline UNC roots during an
     // isolated --home scan or after WSL collection has been disabled.
-    source_cache.restrict_claude_source_probes(&scan_result.claude_scan_roots);
+    source_cache.restrict_claude_source_probes(
+        &scan_result.claude_scan_roots,
+        &scan_result.claude_failed_paths,
+    );
     let mut all_messages: Vec<UnifiedMessage> = Vec::new();
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
@@ -10159,6 +10162,98 @@ mod tests {
         .iter()
         .map(|message| message.tokens.input)
         .sum()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn claude_cached_fallback_survives_unreadable_active_sources() {
+        use std::os::unix::fs::PermissionsExt;
+        struct RestorePermissions(PathBuf, std::fs::Permissions);
+        impl Drop for RestorePermissions {
+            fn drop(&mut self) {
+                std::fs::set_permissions(&self.0, self.1.clone()).unwrap();
+            }
+        }
+        for blocked_kind in ["parent", "subtree", "file"] {
+            let cache_home = tempfile::TempDir::new().unwrap();
+            let home = tempfile::TempDir::new().unwrap();
+            let remote = tempfile::TempDir::new().unwrap();
+            let _cache = redirect_cache_home(cache_home.path());
+            let mut env = crate::paths::test_env::EnvGuard::capture(&[
+                "CLAUDE_CONFIG_DIR",
+                "TOKSCALE_EXTRA_DIRS",
+                "TOKSCALE_CACHED_CLAUDE_DIRS",
+            ]);
+            env.set("CLAUDE_CONFIG_DIR", home.path().join(".claude"));
+            let local = home.path().join(".claude/projects/local");
+            let root = remote.path().join(".claude/projects");
+            let project = root.join("remote");
+            let sibling = root.join("readable");
+            for dir in [&local, &project, &sibling] {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            std::fs::write(
+                local.join("session.jsonl"),
+                claude_cache_fixture_row("host", 125),
+            )
+            .unwrap();
+            let file = project.join("session.jsonl");
+            std::fs::write(
+                &file,
+                claude_cache_fixture_row("remote", 70).replace("2026-10-01", "2026-09-30"),
+            )
+            .unwrap();
+            std::fs::write(
+                sibling.join("other.jsonl"),
+                claude_cache_fixture_row("other", 30),
+            )
+            .unwrap();
+            env.set("TOKSCALE_EXTRA_DIRS", format!("claude:{}", root.display()));
+            env.set(
+                "TOKSCALE_CACHED_CLAUDE_DIRS",
+                serde_json::to_string(&[&root]).unwrap(),
+            );
+            assert_eq!(claude_cache_fixture_total(home.path(), true), 225);
+            let blocked = match blocked_kind {
+                "parent" => remote.path().join(".claude"),
+                "subtree" => project.clone(),
+                _ => file.clone(),
+            };
+            let restore = RestorePermissions(
+                blocked.clone(),
+                std::fs::metadata(&blocked).unwrap().permissions(),
+            );
+            std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o0)).unwrap();
+            // Root users bypass chmod; the portable fallback is covered by the
+            // source-cache unit tests, while this test requires actual denial.
+            if std::fs::File::open(&file).is_ok() {
+                drop(restore);
+                continue;
+            }
+            assert_eq!(
+                claude_cache_fixture_total(home.path(), true),
+                225,
+                "{blocked_kind}"
+            );
+            env.remove("TOKSCALE_EXTRA_DIRS");
+            assert_eq!(
+                claude_cache_fixture_total(home.path(), true),
+                225,
+                "cached-only after failed scan"
+            );
+            drop(restore);
+            env.set("TOKSCALE_EXTRA_DIRS", format!("claude:{}", root.display()));
+            assert_eq!(claude_cache_fixture_total(home.path(), true), 225);
+            std::fs::remove_dir_all(&project).unwrap();
+            assert_eq!(
+                claude_cache_fixture_total(home.path(), true),
+                155,
+                "confirmed deletion still prunes"
+            );
+            env.remove("TOKSCALE_EXTRA_DIRS");
+            assert_eq!(claude_cache_fixture_total(home.path(), true), 155);
+        }
     }
 
     #[test]
