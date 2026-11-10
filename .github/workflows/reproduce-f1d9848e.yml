@@ -1,0 +1,88 @@
+name: Reproduce vendored tokscale f1d9848e
+
+# Temporary workflow: rebuild the already-published token-monitor-f1d9848e
+# Linux-x64 asset with the same runner label, paths, and toolchain used by
+# Javis603/tokscale run 42754805314, so its sha256 can be compared with the
+# pinned 3f2c1623...
+#
+# The only intentional difference is SOURCE_DATE_EPOCH: the original build
+# embedded the runner's wall-clock time in OpenSSL's buildinf, so we pin that
+# exact value to make the comparison meaningful.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPOSITORY: Javis603/tokscale
+  SOURCE_SHA: f1d9848e0969ff33081a3641950e049fa49f4743
+  TARGET: x86_64-unknown-linux-gnu
+  ZIG_DIR: /home/runner/work/_temp/2adcdc17-1186-4c49-8896-8968df31f43f/zig-linux-x86_64-0.13.0
+  SOURCE_DATE_EPOCH: "1794284369"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  reproduce:
+    name: Rebuild tokscale-linux-x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout exact build source
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Rust target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version
+          rustup target add "$TARGET"
+
+      - name: Install Zig 0.13.0 at the CI path
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$ZIG_DIR")"
+          curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz \
+            | tar -xJ -C "$(dirname "$ZIG_DIR")"
+          echo "$ZIG_DIR" >> "$GITHUB_PATH"
+          "$ZIG_DIR/zig" version
+
+      - name: Install cargo-zigbuild 0.24.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/rust-cross/cargo-zigbuild/releases/download/v0.24.1/cargo-zigbuild-x86_64-unknown-linux-gnu.tar.xz \
+            | tar -xJ -C /tmp
+          install -m 755 /tmp/cargo-zigbuild-x86_64-unknown-linux-gnu/cargo-zigbuild "$HOME/.cargo/bin/cargo-zigbuild"
+          cargo zigbuild --version
+
+      - name: Build CLI binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release -p tokscale-cli --target "$TARGET"
+
+      - name: Strip and hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          strip "target/$TARGET/release/tokscale"
+          sha256sum "target/$TARGET/release/tokscale" | tee SHA256SUMS
+          echo "expected: 3f2c16236023869d08638922b142890da4ca6040a80a434b79a5d51c26c9d1c9"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: tokscale-linux-x64-f1d9848e
+          path: |
+            target/x86_64-unknown-linux-gnu/release/tokscale
+            SHA256SUMS
+          if-no-files-found: error
