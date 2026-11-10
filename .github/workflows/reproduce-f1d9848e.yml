@@ -11,6 +11,9 @@ name: Reproduce vendored tokscale f1d9848e
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - repro/f1d9848e
 
 permissions:
   contents: read
